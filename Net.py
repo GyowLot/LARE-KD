@@ -5,10 +5,10 @@ import torchvision.models as models
 
     
 class Student_resnet18(nn.Module):
-    def __init__(self,first_conv,class_num):
+    def __init__(self,first_conv,class_num,pretrained=True):
         super(Student_resnet18, self).__init__()
        
-        self.resnet18 = models.resnet18(pretrained=True)
+        self.resnet18 = models.resnet18(pretrained=pretrained)
         self.resnet18.fc = nn.Linear(self.resnet18.fc.in_features, 128)
         if(first_conv==False):
             self.resnet18.conv1 = nn.Conv2d(3, 64, kernel_size=3,
