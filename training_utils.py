@@ -3,6 +3,7 @@
 import copy
 
 import torch
+import torch.nn.functional as F
 
 
 def build_class_balanced_weights(class_counts, beta=0.9999, device=None):
@@ -203,3 +204,107 @@ def find_best_binary_threshold(probs, targets):
             best_acc = acc
             best_threshold = threshold
     return best_threshold, best_acc
+
+
+def init_class_prototypes(num_classes, feature_dim, device=None):
+    """Initialize EMA class prototypes and observation counts.
+
+    Args:
+        num_classes: number of classes.
+        feature_dim: embedding dimension.
+        device: optional torch device.
+
+    Returns:
+        (prototypes, counts), where prototypes has shape [C, D] and counts
+        has shape [C].
+    """
+    prototypes = torch.zeros(num_classes, feature_dim, dtype=torch.float32, device=device)
+    counts = torch.zeros(num_classes, dtype=torch.long, device=device)
+    return prototypes, counts
+
+
+def update_class_prototypes(prototypes, prototype_counts, features, labels,
+                            momentum=0.9, min_count=2):
+    """Update class prototypes with batch feature means.
+
+    Args:
+        prototypes: EMA prototype tensor [C, D], updated in-place.
+        prototype_counts: per-class observation counts [C], updated in-place.
+        features: student embeddings [B, D].
+        labels: class labels [B].
+        momentum: EMA momentum used after the first valid update.
+        min_count: minimum class samples in the current batch for an update.
+
+    Returns:
+        Number of classes updated in this batch.
+    """
+    if features.dim() != 2:
+        raise ValueError("features must have shape [B, D]")
+    if prototypes.dim() != 2:
+        raise ValueError("prototypes must have shape [C, D]")
+    if features.size(1) != prototypes.size(1):
+        raise ValueError("feature dimension must match prototype dimension")
+    if not 0.0 <= momentum < 1.0:
+        raise ValueError("momentum must be in [0, 1)")
+
+    labels = labels.detach().long().view(-1).to(features.device)
+    features = features.detach()
+    updated_classes = 0
+    min_count = max(int(min_count), 1)
+
+    with torch.no_grad():
+        for cls in torch.unique(labels):
+            cls_idx = int(cls.item())
+            if cls_idx < 0 or cls_idx >= prototypes.size(0):
+                continue
+            mask = labels == cls_idx
+            batch_count = int(mask.sum().item())
+            if batch_count < min_count:
+                continue
+            batch_proto = features[mask].mean(dim=0).to(prototypes.device, dtype=prototypes.dtype)
+            if int(prototype_counts[cls_idx].item()) == 0:
+                prototypes[cls_idx].copy_(batch_proto)
+            else:
+                prototypes[cls_idx].mul_(momentum).add_(batch_proto, alpha=1.0 - momentum)
+            prototype_counts[cls_idx] += batch_count
+            updated_classes += 1
+
+    return updated_classes
+
+
+def prototype_regularization_loss(features, labels, prototypes, temperature=0.2):
+    """Classify embeddings by cosine similarity to class prototypes.
+
+    Args:
+        features: student embeddings [B, D].
+        labels: class labels [B].
+        prototypes: class prototypes [C, D].
+        temperature: softmax temperature for prototype logits.
+
+    Returns:
+        Scalar cross-entropy loss.
+    """
+    if temperature <= 0:
+        raise ValueError("temperature must be > 0")
+    if features.dim() != 2 or prototypes.dim() != 2:
+        raise ValueError("features and prototypes must have shape [N, D] and [C, D]")
+    if features.size(1) != prototypes.size(1):
+        raise ValueError("feature dimension must match prototype dimension")
+
+    labels = labels.long().view(-1).to(features.device)
+    prototype_norms = prototypes.detach().norm(dim=1)
+    active_mask = prototype_norms > 0
+    if not bool(active_mask.any().item()):
+        return features.sum() * 0.0
+    valid_samples = active_mask.to(features.device)[labels]
+    if not bool(valid_samples.any().item()):
+        return features.sum() * 0.0
+
+    safe_prototypes = prototypes.detach().clone().to(features.device, dtype=features.dtype)
+    logits = torch.matmul(
+        F.normalize(features, dim=1),
+        F.normalize(safe_prototypes, dim=1).t(),
+    ) / float(temperature)
+    inactive = (~active_mask).to(logits.device)
+    logits = logits.masked_fill(inactive.view(1, -1), -1e4)
+    return F.cross_entropy(logits[valid_samples], labels[valid_samples])

@@ -18,7 +18,10 @@ from training_utils import (
     build_class_balanced_weights,
     build_sample_weights,
     find_best_binary_threshold,
+    init_class_prototypes,
+    prototype_regularization_loss,
     tta_forward,
+    update_class_prototypes,
 )
 
 
@@ -151,6 +154,56 @@ class TrainingUtilityTests(unittest.TestCase):
         logits = tta_forward(MeanModel(), images, tta_views=2)
 
         self.assertTrue(torch.allclose(logits, torch.tensor([[0.5, 0.5]]), atol=1e-6))
+
+    def test_class_prototypes_initialize_with_expected_shapes(self):
+        prototypes, counts = init_class_prototypes(
+            num_classes=3,
+            feature_dim=128,
+            device=torch.device("cpu"),
+        )
+
+        self.assertEqual(tuple(prototypes.shape), (3, 128))
+        self.assertEqual(tuple(counts.shape), (3,))
+        self.assertTrue(torch.allclose(prototypes, torch.zeros_like(prototypes)))
+        self.assertTrue(torch.equal(counts, torch.zeros_like(counts)))
+
+    def test_class_prototypes_update_only_observed_classes(self):
+        prototypes, counts = init_class_prototypes(3, 2, device=torch.device("cpu"))
+        features = torch.tensor([[1.0, 0.0], [0.0, 1.0], [0.0, 3.0]])
+        labels = torch.tensor([0, 1, 1])
+
+        update_class_prototypes(
+            prototypes,
+            counts,
+            features,
+            labels,
+            momentum=0.9,
+            min_count=1,
+        )
+
+        self.assertTrue(torch.allclose(prototypes[0], torch.tensor([1.0, 0.0]), atol=1e-6))
+        self.assertTrue(torch.allclose(prototypes[1], torch.tensor([0.0, 2.0]), atol=1e-6))
+        self.assertTrue(torch.allclose(prototypes[2], torch.zeros(2), atol=1e-6))
+        self.assertEqual(int(counts[0]), 1)
+        self.assertEqual(int(counts[1]), 2)
+        self.assertEqual(int(counts[2]), 0)
+
+    def test_prototype_regularization_loss_backpropagates_to_features(self):
+        prototypes = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
+        features = torch.tensor([[0.9, 0.1], [0.2, 0.8]], requires_grad=True)
+        labels = torch.tensor([0, 1])
+
+        loss = prototype_regularization_loss(
+            features,
+            labels,
+            prototypes,
+            temperature=0.2,
+        )
+        loss.backward()
+
+        self.assertEqual(tuple(loss.shape), ())
+        self.assertIsNotNone(features.grad)
+        self.assertGreaterEqual(float(loss.detach()), 0.0)
 
 
 if __name__ == "__main__":

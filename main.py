@@ -40,7 +40,10 @@ from training_utils import (
     extract_class_counts,
     extract_labels,
     find_best_binary_threshold,
+    init_class_prototypes,
+    prototype_regularization_loss,
     tta_forward,
+    update_class_prototypes,
     update_ema_model,
 )
 import setproctitle
@@ -139,6 +142,8 @@ def print_run_config(args, num_params):
     print(" Teacher conf   : {:<12} KD conf     : {}".format(args.teacher_conf_thresh, args.kd_conf_thresh))
     print(" Adaptive temp  : {:<12} Warmup      : {}".format(format_flag(args.use_adaptive_temp), args.temp_warmup))
     print(" Lambda strategy: {:<12} KD rampup   : {}".format(args.lambda_strategy, args.kd_weight_rampup))
+    print(" Prototype loss : {:<12} Weight      : {}".format(format_flag(args.use_proto_loss).strip(), args.proto_weight))
+    print(" Proto temp     : {:<12} Warmup      : {}".format(args.proto_temp, args.proto_warmup))
     print(" EMA teacher    : {:<12} Decay       : {}".format(format_flag(args.use_ema_teacher).strip(), args.ema_decay))
     print(" Eval EMA       : {:<12} TTA views   : {}".format(format_flag(args.eval_ema).strip(), args.tta_views))
     print(" ACC threshold  : {}".format(format_flag(args.search_acc_threshold).strip()))
@@ -163,13 +168,15 @@ def print_batch_metrics(partial_epoch, metrics):
     print(
         "[train {:7.2f}] "
         "loss {loss:8.4f} | ce {ce_loss:8.4f} | kd {kd_loss:8.4f} | "
+        "proto {proto_loss:8.4f} | "
         "acc {acc:6.2%} | lambda {mean_lambda:6.3f} | entropy {mean_entropy:6.3f} | "
         "conf {mean_teacher_conf:6.3f} | ARE {are} {are_active_ratio:5.1%} | "
-        "KD {kd_active_ratio:5.1%} | UATS {uats}".format(
+        "KD {kd_active_ratio:5.1%} | UATS {uats} | CPR {proto} {proto_active_classes}".format(
             partial_epoch,
             loss=metrics["loss"],
             ce_loss=metrics["ce_loss"],
             kd_loss=metrics["kd_loss"],
+            proto_loss=metrics["proto_loss"],
             acc=metrics["acc"],
             mean_lambda=metrics["mean_lambda"],
             mean_entropy=metrics["mean_entropy"],
@@ -178,6 +185,8 @@ def print_batch_metrics(partial_epoch, metrics):
             kd_active_ratio=metrics["kd_active_ratio"],
             are=format_flag(metrics["are_enabled"]).strip(),
             uats=format_flag(metrics["adaptive_temp_enabled"]).strip(),
+            proto=format_flag(metrics["proto_enabled"]).strip(),
+            proto_active_classes=metrics["proto_active_classes"],
         )
     )
 
@@ -186,12 +195,13 @@ def print_train_summary(epoch, metrics):
     """Print the train summary for one epoch."""
     print(
         "[train summary] epoch {:03d} | loss {:8.4f} | ce {:8.4f} | kd {:8.4f} | "
-        "acc {:6.2%} | lambda {:6.3f} | entropy {:6.3f} | conf {:6.3f} | "
-        "ARE {} {:5.1%} | KD {:5.1%} | UATS {}".format(
+        "proto {:8.4f} | acc {:6.2%} | lambda {:6.3f} | entropy {:6.3f} | conf {:6.3f} | "
+        "ARE {} {:5.1%} | KD {:5.1%} | UATS {} | CPR {} {}".format(
             epoch,
             metrics["loss"],
             metrics["ce_loss"],
             metrics["kd_loss"],
+            metrics["proto_loss"],
             metrics["acc"],
             metrics["mean_lambda"],
             metrics["mean_entropy"],
@@ -200,6 +210,8 @@ def print_train_summary(epoch, metrics):
             metrics["are_active_ratio"],
             metrics["kd_active_ratio"],
             format_flag(metrics["adaptive_temp_enabled"]).strip(),
+            format_flag(metrics["proto_enabled"]).strip(),
+            metrics["proto_active_classes"],
         )
     )
 
@@ -229,6 +241,7 @@ def write_epoch_metrics(log_path, metrics_dict):
     """Append one epoch of train/test metrics to a tab-separated text file."""
     fieldnames = [
         "epoch", "train_loss", "train_ce_loss", "train_kd_loss", "train_acc",
+        "train_proto_loss", "proto_enabled", "proto_active_classes",
         "mean_lambda", "mean_entropy", "mean_teacher_conf",
         "are_active_ratio", "kd_active_ratio",
         "are_enabled", "adaptive_temp_enabled",
@@ -244,7 +257,8 @@ def write_epoch_metrics(log_path, metrics_dict):
 
 
 def save_best_model(args, epoch, net, optimizer, train_metrics, test_metrics,
-                    metric_name, best_metric, model_path, checkpoint_path):
+                    metric_name, best_metric, model_path, checkpoint_path,
+                    prototype_state=None):
     """Save the best model files and return a text-summary dictionary."""
     torch.save(net, model_path)
     torch.save(
@@ -256,6 +270,7 @@ def save_best_model(args, epoch, net, optimizer, train_metrics, test_metrics,
             "best_metric": best_metric,
             "train_metrics": train_metrics,
             "test_metrics": test_metrics,
+            "prototype_state": prototype_state,
             "args": vars(args),
         },
         checkpoint_path,
@@ -272,6 +287,7 @@ def save_best_model(args, epoch, net, optimizer, train_metrics, test_metrics,
         "train_loss": train_metrics["loss"],
         "train_ce_loss": train_metrics["ce_loss"],
         "train_kd_loss": train_metrics["kd_loss"],
+        "train_proto_loss": train_metrics["proto_loss"],
         "train_acc": train_metrics["acc"],
         "mean_lambda": train_metrics["mean_lambda"],
         "mean_entropy": train_metrics["mean_entropy"],
@@ -280,6 +296,8 @@ def save_best_model(args, epoch, net, optimizer, train_metrics, test_metrics,
         "kd_active_ratio": train_metrics["kd_active_ratio"],
         "are_enabled": train_metrics["are_enabled"],
         "adaptive_temp_enabled": train_metrics["adaptive_temp_enabled"],
+        "proto_enabled": train_metrics["proto_enabled"],
+        "proto_active_classes": train_metrics["proto_active_classes"],
         "model_path": model_path,
         "checkpoint_path": checkpoint_path,
     }
@@ -316,6 +334,12 @@ def write_summary(summary_path, args, last_record, best_auc_info, best_acc_info)
         f.write("lambda_strategy: {}\n".format(args.lambda_strategy))
         f.write("kd_conf_thresh: {}\n".format(args.kd_conf_thresh))
         f.write("kd_weight_rampup: {}\n".format(args.kd_weight_rampup))
+        f.write("use_proto_loss: {}\n".format(args.use_proto_loss))
+        f.write("proto_weight: {}\n".format(args.proto_weight))
+        f.write("proto_temp: {}\n".format(args.proto_temp))
+        f.write("proto_momentum: {}\n".format(args.proto_momentum))
+        f.write("proto_warmup: {}\n".format(args.proto_warmup))
+        f.write("proto_min_count: {}\n".format(args.proto_min_count))
         f.write("use_ema_teacher: {}\n".format(args.use_ema_teacher))
         f.write("ema_decay: {}\n".format(args.ema_decay))
         f.write("eval_ema: {}\n".format(args.eval_ema))
@@ -332,6 +356,7 @@ def write_summary(summary_path, args, last_record, best_auc_info, best_acc_info)
         f.write("-" * 72 + "\n")
         for key in [
             "epoch", "train_loss", "train_ce_loss", "train_kd_loss", "train_acc",
+            "train_proto_loss", "proto_enabled", "proto_active_classes",
             "mean_lambda", "mean_entropy", "mean_teacher_conf",
             "are_active_ratio", "kd_active_ratio",
             "val_loss", "val_acc", "val_auc", "val_f1", "val_threshold",
@@ -349,9 +374,10 @@ def write_summary(summary_path, args, last_record, best_auc_info, best_acc_info)
             for key in [
                 "epoch", "best_metric", "test_loss", "test_acc", "test_auc", "test_f1",
                 "test_threshold",
-                "train_loss", "train_ce_loss", "train_kd_loss", "train_acc",
+                "train_loss", "train_ce_loss", "train_kd_loss", "train_proto_loss", "train_acc",
                 "mean_lambda", "mean_entropy", "mean_teacher_conf",
                 "are_active_ratio", "kd_active_ratio",
+                "proto_enabled", "proto_active_classes",
                 "model_path", "checkpoint_path",
             ]:
                 f.write("{}: {}\n".format(key, info[key]))
@@ -469,6 +495,18 @@ def main():
                         help='minimum teacher confidence for KD; lower-confidence samples get zero KD weight')
     parser.add_argument('--kd_weight_rampup', type=int, default=0,
                         help='linearly ramp KD loss weight over this many epochs; 0 disables ramp-up')
+    parser.add_argument('--use_proto_loss', type=str2bool, default=False,
+                        help='enable class prototype regularization')
+    parser.add_argument('--proto_weight', default=0.1, type=float,
+                        help='weight of the prototype regularization loss')
+    parser.add_argument('--proto_temp', default=0.2, type=float,
+                        help='temperature for prototype classification logits')
+    parser.add_argument('--proto_momentum', default=0.9, type=float,
+                        help='EMA momentum for class prototypes')
+    parser.add_argument('--proto_warmup', type=int, default=5,
+                        help='epochs before adding prototype loss')
+    parser.add_argument('--proto_min_count', type=int, default=2,
+                        help='minimum batch samples per class before prototype update')
     parser.add_argument('--use_ema_teacher', type=str2bool, default=False,
                         help='use an EMA copy as the no-grad teacher branch')
     parser.add_argument('--ema_decay', type=float, default=0.999,
@@ -507,6 +545,16 @@ def main():
         raise ValueError("--kd_conf_thresh must be in [0, 1]")
     if args.kd_weight_rampup < 0:
         raise ValueError("--kd_weight_rampup must be >= 0")
+    if args.proto_weight < 0:
+        raise ValueError("--proto_weight must be >= 0")
+    if args.proto_temp <= 0:
+        raise ValueError("--proto_temp must be > 0")
+    if not 0.0 <= args.proto_momentum < 1.0:
+        raise ValueError("--proto_momentum must be in [0, 1)")
+    if args.proto_warmup < 0:
+        raise ValueError("--proto_warmup must be >= 0")
+    if args.proto_min_count < 1:
+        raise ValueError("--proto_min_count must be >= 1")
     if not 0.0 <= args.label_smoothing < 1.0:
         raise ValueError("--label_smoothing must be in [0, 1)")
     if not 0.0 <= args.cb_beta < 1.0:
@@ -639,6 +687,11 @@ def main():
         init=args.entropy_init,
         device=device,
     )
+    prototype_memory, prototype_counts = init_class_prototypes(
+        args.class_num,
+        feature_dim=128,
+        device=device,
+    )
 
     num_params = sum([p.data.nelement() for p in net.parameters()])
     print_run_config(args, num_params)
@@ -671,7 +724,11 @@ def main():
     best_acc_info = None
     
     for epoch in range(1, args.nEpochs + 1):
-        train_metrics = train(args, epoch, net, ema_net, trainLoader, optimizer, criterion,criterion_2,scheduler, entropy_memory)
+        train_metrics = train(
+            args, epoch, net, ema_net, trainLoader, optimizer, criterion,
+            criterion_2, scheduler, entropy_memory, prototype_memory,
+            prototype_counts,
+        )
         eval_net = ema_net if (args.use_ema_teacher and args.eval_ema) else net
         val_metrics = None
         test_threshold = args.fixed_acc_threshold
@@ -709,7 +766,10 @@ def main():
             "train_loss": train_metrics["loss"],
             "train_ce_loss": train_metrics["ce_loss"],
             "train_kd_loss": train_metrics["kd_loss"],
+            "train_proto_loss": train_metrics["proto_loss"],
             "train_acc": train_metrics["acc"],
+            "proto_enabled": train_metrics["proto_enabled"],
+            "proto_active_classes": train_metrics["proto_active_classes"],
             "mean_lambda": train_metrics["mean_lambda"],
             "mean_entropy": train_metrics["mean_entropy"],
             "mean_teacher_conf": train_metrics["mean_teacher_conf"],
@@ -733,6 +793,10 @@ def main():
             "is_best_acc": is_best_acc,
         }
         write_epoch_metrics(epoch_log_path, epoch_record)
+        prototype_state = {
+            "prototypes": prototype_memory.detach().cpu(),
+            "counts": prototype_counts.detach().cpu(),
+        }
 
         if is_best_auc:
             best_auc_info = save_best_model(
@@ -740,12 +804,14 @@ def main():
                 metric_name="AUC", best_metric=best_auc,
                 model_path=best_auc_model_path,
                 checkpoint_path=best_auc_checkpoint_path,
+                prototype_state=prototype_state,
             )
             save_best_model(
                 args, epoch, eval_net, optimizer, train_metrics, test_metrics,
                 metric_name="AUC", best_metric=best_auc,
                 model_path=best_model_path,
                 checkpoint_path=best_checkpoint_path,
+                prototype_state=prototype_state,
             )
             print_best_message("AUC", epoch, best_auc)
 
@@ -755,6 +821,7 @@ def main():
                 metric_name="ACC", best_metric=best_acc,
                 model_path=best_acc_model_path,
                 checkpoint_path=best_acc_checkpoint_path,
+                prototype_state=prototype_state,
             )
             print_best_message("ACC", epoch, best_acc)
         write_summary(summary_path, args, epoch_record, best_auc_info, best_acc_info)
@@ -763,7 +830,9 @@ def main():
     
 
     
-def train(args, epoch, net, ema_net, trainLoader, optimizer, criterion, criterion_2, scheduler, entropy_memory):
+def train(args, epoch, net, ema_net, trainLoader, optimizer, criterion,
+          criterion_2, scheduler, entropy_memory, prototype_memory,
+          prototype_counts):
     net.train()                                       # 设置网络为训练模式
     
  
@@ -777,6 +846,7 @@ def train(args, epoch, net, ema_net, trainLoader, optimizer, criterion, criterio
     total_correct = 0
     total_ce_loss = 0
     total_kd_loss = 0
+    total_proto_loss = 0
     total_lambda = 0
     total_entropy = 0
     total_teacher_conf = 0
@@ -786,6 +856,8 @@ def train(args, epoch, net, ema_net, trainLoader, optimizer, criterion, criterio
     nTrain = len(trainLoader.dataset)
     are_enabled = args.use_are and epoch >= args.are_warmup
     adaptive_temp_enabled = args.use_adaptive_temp and epoch >= args.temp_warmup
+    proto_enabled = args.use_proto_loss and epoch >= args.proto_warmup
+    total_proto_active_classes = 0
 #     print(nTrain)
     for batch_idx, (pos_1, target, indices) in enumerate(trainLoader):
 
@@ -829,7 +901,7 @@ def train(args, epoch, net, ema_net, trainLoader, optimizer, criterion, criterio
             else:
                 are_active_count = 0
             
-        output = net(images_2)
+        features, output = net(images_2, return_embedding=True)
         
         ce_logits = apply_logit_adjustment(output, args.class_counts, tau=args.logit_adjust_tau)
         loss_1 = criterion(ce_logits,target)
@@ -877,21 +949,44 @@ def train(args, epoch, net, ema_net, trainLoader, optimizer, criterion, criterio
             lambda_i,
             sample_weight=kd_sample_weight,
         )
+        if args.use_proto_loss:
+            if proto_enabled:
+                loss_proto = prototype_regularization_loss(
+                    features,
+                    target,
+                    prototype_memory,
+                    temperature=args.proto_temp,
+                )
+            else:
+                loss_proto = features.sum() * 0.0
+            proto_active_classes = update_class_prototypes(
+                prototype_memory,
+                prototype_counts,
+                features,
+                target,
+                momentum=args.proto_momentum,
+                min_count=args.proto_min_count,
+            )
+        else:
+            loss_proto = features.sum() * 0.0
+            proto_active_classes = 0
         if args.kd_weight_rampup > 0:
             kd_weight = args.lamda * min(float(epoch) / float(args.kd_weight_rampup), 1.0)
         else:
             kd_weight = args.lamda
-        loss = loss_1 + kd_weight * (args.temp ** 2) * loss_2
+        loss = loss_1 + kd_weight * (args.temp ** 2) * loss_2 + args.proto_weight * loss_proto
         
 
         total_loss = loss.item()+total_loss
         total_ce_loss += loss_1.item()
         total_kd_loss += loss_2.item()
+        total_proto_loss += loss_proto.item()
         total_lambda += float(lambda_i.detach().mean().cpu()) * output.size(0)
         total_entropy += float(entropy.detach().mean().cpu()) * output.size(0)
         total_teacher_conf += float(teacher_conf.detach().mean().cpu()) * output.size(0)
         total_are_active += are_active_count
         total_kd_active += kd_active_count
+        total_proto_active_classes += proto_active_classes
         seen_samples += output.size(0)
         
         optimizer.zero_grad()
@@ -913,6 +1008,7 @@ def train(args, epoch, net, ema_net, trainLoader, optimizer, criterion, criterio
                     "loss": loss.item(),
                     "ce_loss": loss_1.item(),
                     "kd_loss": loss_2.item(),
+                    "proto_loss": loss_proto.item(),
                     "acc": correct/output.size(0),
                     "mean_lambda": float(lambda_i.detach().mean().cpu()),
                     "mean_entropy": float(entropy.detach().mean().cpu()),
@@ -921,6 +1017,8 @@ def train(args, epoch, net, ema_net, trainLoader, optimizer, criterion, criterio
                     "kd_active_ratio": kd_active_count / output.size(0),
                     "are_enabled": are_enabled,
                     "adaptive_temp_enabled": adaptive_temp_enabled,
+                    "proto_enabled": proto_enabled,
+                    "proto_active_classes": proto_active_classes,
                 },
             )
     
@@ -932,6 +1030,7 @@ def train(args, epoch, net, ema_net, trainLoader, optimizer, criterion, criterio
         "loss": total_loss/denom_batches,
         "ce_loss": total_ce_loss/denom_batches,
         "kd_loss": total_kd_loss/denom_batches,
+        "proto_loss": total_proto_loss/denom_batches,
         "acc": total_correct/denom_samples,
         "mean_lambda": total_lambda/denom_samples,
         "mean_entropy": total_entropy/denom_samples,
@@ -940,6 +1039,8 @@ def train(args, epoch, net, ema_net, trainLoader, optimizer, criterion, criterio
         "kd_active_ratio": total_kd_active/denom_samples,
         "are_enabled": are_enabled,
         "adaptive_temp_enabled": adaptive_temp_enabled,
+        "proto_enabled": proto_enabled,
+        "proto_active_classes": total_proto_active_classes/denom_batches,
     }
     print_train_summary(epoch, train_metrics)
     return train_metrics

@@ -13,6 +13,10 @@ temperature scaling self-knowledge distillation with two practical modules:
   class-balanced CE, label smoothing, and flip-based test-time augmentation
   (TTA). These are the recommended switches when trying to improve the ACC/AUC
   numbers reported for TSS-KD.
+- **CPR: Class Prototype Regularization** keeps lightweight EMA class
+  prototypes in the 128-dimensional embedding space and adds an optional
+  prototype classification loss. This encourages compact intra-class features
+  without adding another backbone forward.
 
 By default the code can still run in the original self-distillation setting:
 ResNet18 is used as the backbone, the teacher view is computed with
@@ -26,16 +30,18 @@ Training uses two augmented views of each image:
 
 1. **Teacher view**: weakly augmented image, forwarded without gradient.
 2. **Student view**: augmented image, optionally enhanced by ARE after warm-up.
-3. **Loss**: cross entropy plus temperature-scaled KD loss.
-4. **Optional EMA teacher**: the KD target and ARE attention are generated from
+3. **Loss**: cross entropy plus temperature-scaled KD loss, optionally plus CPR.
+4. **Optional CPR**: student embeddings are pulled toward EMA class prototypes.
+5. **Optional EMA teacher**: the KD target and ARE attention are generated from
    a smoothed copy of the online student.
-5. **Optional TTA evaluation**: validation/test logits are averaged over
+6. **Optional TTA evaluation**: validation/test logits are averaged over
    deterministic flip views.
 
 The training objective is:
 
 ```text
 loss = CE(student_logits, label) + kd_weight * tau^2 * KD(student, teacher)
+       + proto_weight * CPR(student_embedding, label)
 ```
 
 `kd_weight` is `--lamda` by default and can be linearly warmed up with
@@ -134,6 +140,18 @@ python main.py --dataset derma \
   --entropy_momentum 0.95
 ```
 
+Prototype regularization only:
+
+```bash
+python main.py --dataset derma \
+  --use_are False \
+  --use_adaptive_temp False \
+  --use_proto_loss True \
+  --proto_weight 0.1 \
+  --proto_temp 0.2 \
+  --proto_warmup 5
+```
+
 Conservative full LARE-KD:
 
 ```bash
@@ -147,8 +165,15 @@ python main.py --dataset derma \
   --lambda_min 0.8 \
   --lambda_max 1.2 \
   --entropy_momentum 0.95 \
-  --kd_weight_rampup 10
+  --kd_weight_rampup 10 \
+  --use_proto_loss True \
+  --proto_weight 0.1
 ```
+
+If ARE or UATS is unstable on your dataset, first compare the baseline against
+`--use_proto_loss True` alone. CPR is usually the lowest-risk module to test
+because it reuses the existing student embedding and does not alter images or
+teacher probabilities.
 
 Performance-oriented LARE-KD for chasing the table metrics:
 
@@ -171,7 +196,9 @@ python main.py --dataset derma \
   --lambda_min 0.8 \
   --lambda_max 1.2 \
   --entropy_momentum 0.95 \
-  --kd_weight_rampup 10
+  --kd_weight_rampup 10 \
+  --use_proto_loss True \
+  --proto_weight 0.1
 ```
 
 Binary validation-tuned ACC run:
@@ -201,7 +228,8 @@ External ImageFolder example:
 
 ```bash
 python main.py --dataset isic_m --data_root ./data \
-  --use_are True --use_adaptive_temp True \
+  --use_are False --use_adaptive_temp False \
+  --use_proto_loss True \
   --use_ema_teacher True --use_class_balanced_ce True \
   --use_balanced_sampler True --tta_views 4
 ```
@@ -219,6 +247,13 @@ python main.py --dataset isic_m --data_root ./data \
 - `--lambda_min`, `--lambda_max`: adaptive lambda range.
 - `--kd_conf_thresh`: minimum teacher confidence required for KD contribution.
 - `--kd_weight_rampup`: linearly warm up the KD loss weight.
+- `--use_proto_loss`: enable class prototype regularization.
+- `--proto_weight`: weight for the prototype loss. Start with `0.1`.
+- `--proto_temp`: prototype classification temperature. The default is `0.2`.
+- `--proto_momentum`: EMA momentum for class prototypes.
+- `--proto_warmup`: epochs before prototype loss contributes to training.
+- `--proto_min_count`: minimum same-class samples in a batch before updating a
+  prototype.
 - `--use_ema_teacher`: use an EMA copy as the teacher branch.
 - `--ema_decay`: EMA update decay. The default is `0.999`.
 - `--eval_ema`: evaluate and save EMA weights when EMA teacher is enabled.
