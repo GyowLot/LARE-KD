@@ -7,11 +7,13 @@ from adaptive_temp import (
     adaptive_tskd_loss,
     adaptive_tskd_softmax,
     compute_entropy,
+    compute_lambda_from_confidence,
     compute_lambda_from_entropy,
     init_entropy_memory,
     update_entropy_memory,
 )
 from attention_enhance import generate_attention_map, get_attention_boxes
+from training_utils import build_class_balanced_weights, tta_forward
 
 
 class AttentionEnhanceTests(unittest.TestCase):
@@ -82,6 +84,42 @@ class AdaptiveTemperatureTests(unittest.TestCase):
         self.assertIsNotNone(student.grad)
         self.assertIsNone(teacher.grad)
         self.assertGreaterEqual(float(loss.detach()), 0.0)
+
+    def test_confidence_inverse_lambda_gives_uncertain_samples_larger_lambda(self):
+        confidence = torch.tensor([0.95, 0.50])
+
+        lambda_i = compute_lambda_from_confidence(
+            confidence, num_classes=2, lambda_min=0.8, lambda_max=1.2
+        )
+
+        self.assertLess(float(lambda_i[0]), float(lambda_i[1]))
+        self.assertGreaterEqual(float(lambda_i.min()), 0.8)
+        self.assertLessEqual(float(lambda_i.max()), 1.2)
+
+
+class TrainingUtilityTests(unittest.TestCase):
+    def test_class_balanced_weights_give_rare_classes_larger_weight(self):
+        weights = build_class_balanced_weights(
+            torch.tensor([90, 10]), beta=0.99, device=torch.device("cpu")
+        )
+
+        self.assertEqual(tuple(weights.shape), (2,))
+        self.assertGreater(float(weights[1]), float(weights[0]))
+        self.assertAlmostEqual(float(weights.mean()), 1.0, places=6)
+
+    def test_tta_forward_averages_original_and_flipped_predictions(self):
+        class MeanModel(torch.nn.Module):
+            def forward(self, x):
+                left = x[:, :, :, :2].mean(dim=(1, 2, 3))
+                right = x[:, :, :, 2:].mean(dim=(1, 2, 3))
+                return torch.stack([left, right], dim=1)
+
+        images = torch.zeros(1, 1, 2, 4)
+        images[:, :, :, :2] = 1.0
+
+        logits = tta_forward(MeanModel(), images, tta_views=2)
+
+        self.assertTrue(torch.allclose(logits, torch.tensor([[0.5, 0.5]]), atol=1e-6))
 
 
 if __name__ == "__main__":

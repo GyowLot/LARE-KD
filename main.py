@@ -32,6 +32,13 @@ from adaptive_temp import (
     update_entropy_memory,
 )
 from attention_enhance import apply_local_clahe_tensor, generate_attention_map, get_attention_boxes
+from training_utils import (
+    build_class_balanced_weights,
+    create_ema_model,
+    extract_class_counts,
+    tta_forward,
+    update_ema_model,
+)
 import setproctitle
 
 os.environ["CUDA_VISIBLE_DEVICES"] = '0'
@@ -120,12 +127,15 @@ def print_run_config(args, num_params):
     print(" Classes        : {:<12} Image size  : {}".format(args.class_num, args.image_size))
     print(" Batch size     : {:<12} Epochs      : {}".format(args.batchSz, args.nEpochs))
     print(" Optimizer      : {:<12} LR          : {}".format(args.opt, args.lr))
+    print(" Label smooth   : {:<12} CB loss     : {}".format(args.label_smoothing, format_flag(args.use_class_balanced_ce).strip()))
     print(" Temperature    : {:<12} Fixed lambda: {}".format(args.temp, args.fixed_lambda))
     print(" ARE            : {:<12} Warmup      : {}".format(format_flag(args.use_are), args.are_warmup))
     print(" ARE prob       : {:<12} CLAHE clip  : {}".format(args.are_prob, args.clahe_clip_limit))
     print(" Teacher conf   : {:<12} KD conf     : {}".format(args.teacher_conf_thresh, args.kd_conf_thresh))
     print(" Adaptive temp  : {:<12} Warmup      : {}".format(format_flag(args.use_adaptive_temp), args.temp_warmup))
     print(" Lambda strategy: {:<12} KD rampup   : {}".format(args.lambda_strategy, args.kd_weight_rampup))
+    print(" EMA teacher    : {:<12} Decay       : {}".format(format_flag(args.use_ema_teacher).strip(), args.ema_decay))
+    print(" Eval EMA       : {:<12} TTA views   : {}".format(format_flag(args.eval_ema).strip(), args.tta_views))
     print(" Save dir       : {}".format(args.save))
     if args.dataset_source == "imagefolder":
         print(" Train dir      : {}".format(args.train_dir))
@@ -277,6 +287,11 @@ def write_summary(summary_path, args, last_record, best_auc_info, best_acc_info)
         f.write("batch_size: {}\n".format(args.batchSz))
         f.write("epochs: {}\n".format(args.nEpochs))
         f.write("lr: {}\n".format(args.lr))
+        f.write("label_smoothing: {}\n".format(args.label_smoothing))
+        f.write("use_class_balanced_ce: {}\n".format(args.use_class_balanced_ce))
+        f.write("cb_beta: {}\n".format(args.cb_beta))
+        f.write("class_counts: {}\n".format(args.class_counts))
+        f.write("class_weights: {}\n".format(args.class_weights))
         f.write("temp: {}\n".format(args.temp))
         f.write("fixed_lambda: {}\n".format(args.fixed_lambda))
         f.write("use_are: {}\n".format(args.use_are))
@@ -288,6 +303,10 @@ def write_summary(summary_path, args, last_record, best_auc_info, best_acc_info)
         f.write("lambda_strategy: {}\n".format(args.lambda_strategy))
         f.write("kd_conf_thresh: {}\n".format(args.kd_conf_thresh))
         f.write("kd_weight_rampup: {}\n".format(args.kd_weight_rampup))
+        f.write("use_ema_teacher: {}\n".format(args.use_ema_teacher))
+        f.write("ema_decay: {}\n".format(args.ema_decay))
+        f.write("eval_ema: {}\n".format(args.eval_ema))
+        f.write("tta_views: {}\n".format(args.tta_views))
         f.write("data_root: {}\n".format(args.data_root))
         f.write("train_dir: {}\n".format(args.train_dir))
         f.write("test_dir: {}\n".format(args.test_dir))
@@ -381,6 +400,12 @@ def main():
     parser.add_argument('--lr', default=0.01, type=float, help='initial learning rate')
     parser.add_argument('--save', default=None,
                         help='save directory; defaults to an auto-generated run directory')
+    parser.add_argument('--label_smoothing', default=0.0, type=float,
+                        help='label smoothing for the training CE loss')
+    parser.add_argument('--use_class_balanced_ce', type=str2bool, default=False,
+                        help='use effective-number class-balanced CE weights')
+    parser.add_argument('--cb_beta', default=0.9999, type=float,
+                        help='beta for effective-number class-balanced CE')
     parser.add_argument('--use_are', type=str2bool, default=False,
                         help='enable Attention-guided Regional Enhancement')
     parser.add_argument('--are_warmup', type=int, default=10,
@@ -419,6 +444,14 @@ def main():
                         help='minimum teacher confidence for KD; lower-confidence samples get zero KD weight')
     parser.add_argument('--kd_weight_rampup', type=int, default=0,
                         help='linearly ramp KD loss weight over this many epochs; 0 disables ramp-up')
+    parser.add_argument('--use_ema_teacher', type=str2bool, default=False,
+                        help='use an EMA copy as the no-grad teacher branch')
+    parser.add_argument('--ema_decay', type=float, default=0.999,
+                        help='EMA teacher decay')
+    parser.add_argument('--eval_ema', type=str2bool, default=True,
+                        help='evaluate and save the EMA model when EMA teacher is enabled')
+    parser.add_argument('--tta_views', type=int, default=1,
+                        help='test-time augmentation views: 1 original, 2 +hflip, 3 +vflip, 4 +hvflip')
 
     parser.add_argument('--opt', type=str, default='sgd',
                         choices=('sgd', 'adam', 'rmsprop'))
@@ -443,9 +476,16 @@ def main():
         raise ValueError("--kd_conf_thresh must be in [0, 1]")
     if args.kd_weight_rampup < 0:
         raise ValueError("--kd_weight_rampup must be >= 0")
+    if not 0.0 <= args.label_smoothing < 1.0:
+        raise ValueError("--label_smoothing must be in [0, 1)")
+    if not 0.0 <= args.cb_beta < 1.0:
+        raise ValueError("--cb_beta must be in [0, 1)")
+    if not 0.0 <= args.ema_decay < 1.0:
+        raise ValueError("--ema_decay must be in [0, 1)")
+    if args.tta_views < 1:
+        raise ValueError("--tta_views must be >= 1")
 
     setproctitle.setproctitle(args.save)
-    criterion = nn.CrossEntropyLoss()
     criterion_2 = None
 
     os.makedirs(args.save, exist_ok=True)
@@ -496,12 +536,29 @@ def main():
                 )
             )
     BCdata_trian = IndexedDataset(BCdata_trian_base)
+    class_counts = extract_class_counts(BCdata_trian_base, args.class_num)
+    args.class_counts = [int(x) for x in class_counts.cpu().tolist()]
+    class_weights = None
+    args.class_weights = None
+    if args.use_class_balanced_ce:
+        class_weights = build_class_balanced_weights(
+            class_counts,
+            beta=args.cb_beta,
+            device=device,
+        )
+        args.class_weights = [float(x) for x in class_weights.detach().cpu().tolist()]
+    criterion = nn.CrossEntropyLoss(
+        weight=class_weights,
+        label_smoothing=args.label_smoothing,
+    )
+    test_criterion = nn.CrossEntropyLoss()
     
     trainLoader = DataLoader(BCdata_trian, batch_size=args.batchSz, shuffle=True, drop_last=True, num_workers=4)
     testLoader = DataLoader(BCdata_test, batch_size=args.batchSz, shuffle=False, drop_last=False, num_workers=4)
     
     net = Student_resnet18(first_conv=args.first_conv, class_num=args.class_num)
     net = net.to(device) 
+    ema_net = create_ema_model(net) if args.use_ema_teacher else None
     args.device = device
     args.norm_mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
     args.norm_std = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
@@ -543,9 +600,10 @@ def main():
     best_acc_info = None
     
     for epoch in range(1, args.nEpochs + 1):
-        train_metrics = train(args, epoch, net, trainLoader, optimizer, criterion,criterion_2,scheduler, entropy_memory)
-        test_metrics = test(args, epoch, net, testLoader,optimizer, criterion)
-        torch.save(net, os.path.join(args.save, str(epoch)+'.pth'))
+        train_metrics = train(args, epoch, net, ema_net, trainLoader, optimizer, criterion,criterion_2,scheduler, entropy_memory)
+        eval_net = ema_net if (args.use_ema_teacher and args.eval_ema) else net
+        test_metrics = test(args, epoch, eval_net, testLoader,optimizer, test_criterion)
+        torch.save(eval_net, os.path.join(args.save, str(epoch)+'.pth'))
         is_best_auc = test_metrics["auc"] > best_auc
         is_best_acc = test_metrics["acc"] > best_acc
         if is_best_auc:
@@ -579,13 +637,13 @@ def main():
 
         if is_best_auc:
             best_auc_info = save_best_model(
-                args, epoch, net, optimizer, train_metrics, test_metrics,
+                args, epoch, eval_net, optimizer, train_metrics, test_metrics,
                 metric_name="AUC", best_metric=best_auc,
                 model_path=best_auc_model_path,
                 checkpoint_path=best_auc_checkpoint_path,
             )
             save_best_model(
-                args, epoch, net, optimizer, train_metrics, test_metrics,
+                args, epoch, eval_net, optimizer, train_metrics, test_metrics,
                 metric_name="AUC", best_metric=best_auc,
                 model_path=best_model_path,
                 checkpoint_path=best_checkpoint_path,
@@ -594,7 +652,7 @@ def main():
 
         if is_best_acc:
             best_acc_info = save_best_model(
-                args, epoch, net, optimizer, train_metrics, test_metrics,
+                args, epoch, eval_net, optimizer, train_metrics, test_metrics,
                 metric_name="ACC", best_metric=best_acc,
                 model_path=best_acc_model_path,
                 checkpoint_path=best_acc_checkpoint_path,
@@ -606,10 +664,14 @@ def main():
     
 
     
-def train(args, epoch, net, trainLoader, optimizer, criterion, criterion_2, scheduler, entropy_memory):
+def train(args, epoch, net, ema_net, trainLoader, optimizer, criterion, criterion_2, scheduler, entropy_memory):
     net.train()                                       # 设置网络为训练模式
     
  
+    teacher_net = ema_net if args.use_ema_teacher else net
+    if teacher_net is not net:
+        teacher_net.eval()
+
     print_epoch_header(epoch, args.nEpochs)
     nProcessed = 0
     total_loss = 0
@@ -639,7 +701,7 @@ def train(args, epoch, net, trainLoader, optimizer, criterion, criterion_2, sche
         # gammamix
         with torch.no_grad():
             # another view
-            output_last, teacher_feat = net(images_1, return_feature=True)
+            output_last, teacher_feat = teacher_net(images_1, return_feature=True)
             teacher_prob = F.softmax(output_last.detach(), dim=1)
             teacher_conf = teacher_prob.max(dim=1)[0]
             if are_enabled:
@@ -735,6 +797,8 @@ def train(args, epoch, net, trainLoader, optimizer, criterion, criterion_2, sche
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
+        if ema_net is not None:
+            update_ema_model(ema_net, net, decay=args.ema_decay)
         
         partialEpoch = epoch + batch_idx / len(trainLoader) - 1
         prediction = torch.argmax(output, 1)
@@ -804,9 +868,9 @@ def test(args, epoch, net, testLoader,optimizer, criterion):
             images = pos_1.to(args.device)
             target = target.to(args.device).long().view(-1)
             
-            output = net(images)
+            output = tta_forward(net, images, tta_views=args.tta_views)
             loss = criterion(output,target)
-            total_loss = loss.item()+total_loss
+            total_loss = loss.item() * images.size(0) + total_loss
             b,_ = output.size()
             output = F.softmax(output,dim=1)
 #             print(prediction)

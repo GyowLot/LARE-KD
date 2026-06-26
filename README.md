@@ -9,10 +9,16 @@ temperature scaling self-knowledge distillation with two practical modules:
 - **UATS: Uncertainty-guided Adaptive Temperature Scaling** estimates teacher
   uncertainty and assigns sample-wise non-target temperature multipliers for
   self-knowledge distillation.
+- **Stability extensions** add an optional EMA teacher, effective-number
+  class-balanced CE, label smoothing, and flip-based test-time augmentation
+  (TTA). These are the recommended switches when trying to improve the ACC/AUC
+  numbers reported for TSS-KD.
 
-The code keeps the original self-distillation setting: ResNet18 is used as the
-backbone, teacher and student branches share weights, the teacher view is
-computed with `torch.no_grad()`, and only the student view is optimized.
+By default the code can still run in the original self-distillation setting:
+ResNet18 is used as the backbone, the teacher view is computed with
+`torch.no_grad()`, and only the student view is optimized. When
+`--use_ema_teacher True` is enabled, the no-gradient teacher branch is replaced
+by an exponential moving average copy of the student for a more stable target.
 
 ## Method Overview
 
@@ -21,6 +27,10 @@ Training uses two augmented views of each image:
 1. **Teacher view**: weakly augmented image, forwarded without gradient.
 2. **Student view**: augmented image, optionally enhanced by ARE after warm-up.
 3. **Loss**: cross entropy plus temperature-scaled KD loss.
+4. **Optional EMA teacher**: the KD target and ARE attention are generated from
+   a smoothed copy of the online student.
+5. **Optional TTA evaluation**: validation/test logits are averaged over
+   deterministic flip views.
 
 The training objective is:
 
@@ -133,11 +143,34 @@ python main.py --dataset derma \
   --kd_weight_rampup 10
 ```
 
+Performance-oriented LARE-KD for chasing the table metrics:
+
+```bash
+python main.py --dataset derma \
+  --use_are True \
+  --use_adaptive_temp True \
+  --use_ema_teacher True \
+  --eval_ema True \
+  --use_class_balanced_ce True \
+  --label_smoothing 0.05 \
+  --tta_views 4 \
+  --are_warmup 20 \
+  --temp_warmup 20 \
+  --are_prob 0.5 \
+  --clahe_clip_limit 1.5 \
+  --lambda_strategy confidence_inverse \
+  --lambda_min 0.8 \
+  --lambda_max 1.2 \
+  --entropy_momentum 0.95 \
+  --kd_weight_rampup 10
+```
+
 External ImageFolder example:
 
 ```bash
 python main.py --dataset isic_m --data_root ./data \
-  --use_are True --use_adaptive_temp True
+  --use_are True --use_adaptive_temp True \
+  --use_ema_teacher True --use_class_balanced_ce True --tta_views 4
 ```
 
 ## Important Options
@@ -153,6 +186,14 @@ python main.py --dataset isic_m --data_root ./data \
 - `--lambda_min`, `--lambda_max`: adaptive lambda range.
 - `--kd_conf_thresh`: minimum teacher confidence required for KD contribution.
 - `--kd_weight_rampup`: linearly warm up the KD loss weight.
+- `--use_ema_teacher`: use an EMA copy as the teacher branch.
+- `--ema_decay`: EMA update decay. The default is `0.999`.
+- `--eval_ema`: evaluate and save EMA weights when EMA teacher is enabled.
+- `--use_class_balanced_ce`: use effective-number class weights for CE.
+- `--cb_beta`: beta value for class-balanced CE.
+- `--label_smoothing`: CE label smoothing.
+- `--tta_views`: deterministic test-time augmentation views. Use `4` for
+  original, horizontal flip, vertical flip, and both flips.
 - `--save`: output directory. If omitted, a timestamped directory is created
   under `./result/`.
 
@@ -168,9 +209,14 @@ Each run writes these files under the save directory:
 
 Training logs include loss, CE loss, KD loss, accuracy, mean lambda, mean
 entropy, mean teacher confidence, ARE application ratio, and KD active ratio.
+`summary.txt` also records class counts, class weights, EMA/TTA settings, and
+all LARE-KD control flags used for the run.
 
 ## Practical Notes
 
+- The first serious run should use EMA teacher, class-balanced CE, and TTA. They
+  directly target the most common failure modes in DermaMNIST, ISIC, and
+  CBIS-DDSM: unstable teacher targets and class imbalance.
 - If LARE-KD performs worse than the baseline, first try conservative settings:
   `--lambda_min 0.8 --lambda_max 1.2 --are_prob 0.5 --clahe_clip_limit 1.5`.
 - Use `epoch_metrics.txt` to check whether the issue is early instability,
@@ -179,9 +225,14 @@ entropy, mean teacher confidence, ARE application ratio, and KD active ratio.
   `--temp_warmup`.
 - For noisy local enhancement, lower `--are_prob`, increase `--are_warmup`, or
   use a smaller `--clahe_clip_limit`.
+- Recommended ablation order:
+  1. baseline TSS-KD;
+  2. baseline + EMA teacher;
+  3. baseline + EMA + class-balanced CE;
+  4. full LARE-KD + EMA + class-balanced CE + TTA.
 
 ## Quick Verification
 
 ```bash
-python -m py_compile main.py adaptive_temp.py attention_enhance.py datapreprocess.py
+python -m py_compile main.py adaptive_temp.py attention_enhance.py datapreprocess.py training_utils.py
 ```
