@@ -118,42 +118,6 @@ def create_ema_model(model):
     return ema_model
 
 
-def clone_state_dict_cpu(model):
-    """Clone a model state dict onto CPU for in-memory checkpoint ensembles."""
-    return {
-        name: value.detach().cpu().clone()
-        for name, value in model.state_dict().items()
-    }
-
-
-def update_topk_snapshots(snapshots, state_dict, metric, epoch, max_k=3):
-    """Insert one model snapshot and keep the top-k by metric.
-
-    Args:
-        snapshots: existing list of snapshot dictionaries.
-        state_dict: model state dict, usually from ``clone_state_dict_cpu``.
-        metric: selection metric where larger is better.
-        epoch: epoch number for traceability.
-        max_k: number of snapshots to keep.
-
-    Returns:
-        A sorted list of snapshot dictionaries.
-    """
-    if max_k <= 0:
-        return []
-    new_snapshots = list(snapshots)
-    new_snapshots.append({
-        "epoch": int(epoch),
-        "metric": float(metric),
-        "state_dict": {
-            name: value.detach().cpu().clone()
-            for name, value in state_dict.items()
-        },
-    })
-    new_snapshots.sort(key=lambda item: item["metric"], reverse=True)
-    return new_snapshots[:max_k]
-
-
 def update_ema_model(ema_model, model, decay=0.999):
     """Update EMA model parameters and buffers from the online model.
 

@@ -36,13 +36,11 @@ from training_utils import (
     apply_logit_adjustment,
     build_class_balanced_weights,
     build_sample_weights,
-    clone_state_dict_cpu,
     create_ema_model,
     extract_class_counts,
     extract_labels,
     find_best_binary_threshold,
     tta_forward,
-    update_topk_snapshots,
     update_ema_model,
 )
 import setproctitle
@@ -133,7 +131,6 @@ def print_run_config(args, num_params):
     print(" Classes        : {:<12} Image size  : {}".format(args.class_num, args.image_size))
     print(" Batch size     : {:<12} Epochs      : {}".format(args.batchSz, args.nEpochs))
     print(" Optimizer      : {:<12} LR          : {}".format(args.opt, args.lr))
-    print(" Scheduler      : {:<12} Pretrained  : {}".format(args.scheduler, format_flag(args.pretrained).strip()))
     print(" Label smooth   : {:<12} CB loss     : {}".format(args.label_smoothing, format_flag(args.use_class_balanced_ce).strip()))
     print(" Balanced samp. : {:<12} Logit adj.  : {}".format(format_flag(args.use_balanced_sampler).strip(), args.logit_adjust_tau))
     print(" Temperature    : {:<12} Fixed lambda: {}".format(args.temp, args.fixed_lambda))
@@ -145,7 +142,6 @@ def print_run_config(args, num_params):
     print(" EMA teacher    : {:<12} Decay       : {}".format(format_flag(args.use_ema_teacher).strip(), args.ema_decay))
     print(" Eval EMA       : {:<12} TTA views   : {}".format(format_flag(args.eval_ema).strip(), args.tta_views))
     print(" ACC threshold  : {}".format(format_flag(args.search_acc_threshold).strip()))
-    print(" Ensemble top-k : {:<12} Metric      : {}".format(args.ensemble_top_k, args.ensemble_metric))
     print(" Save dir       : {}".format(args.save))
     if args.dataset_source == "imagefolder":
         print(" Train dir      : {}".format(args.train_dir))
@@ -289,7 +285,7 @@ def save_best_model(args, epoch, net, optimizer, train_metrics, test_metrics,
     }
 
 
-def write_summary(summary_path, args, last_record, best_auc_info, best_acc_info, ensemble_info=None):
+def write_summary(summary_path, args, last_record, best_auc_info, best_acc_info):
     """Write one centralized summary file for the current run."""
     with open(summary_path, "w") as f:
         f.write("LARE-KD run summary\n")
@@ -302,8 +298,6 @@ def write_summary(summary_path, args, last_record, best_auc_info, best_acc_info,
         f.write("batch_size: {}\n".format(args.batchSz))
         f.write("epochs: {}\n".format(args.nEpochs))
         f.write("lr: {}\n".format(args.lr))
-        f.write("scheduler: {}\n".format(args.scheduler))
-        f.write("pretrained: {}\n".format(args.pretrained))
         f.write("label_smoothing: {}\n".format(args.label_smoothing))
         f.write("use_class_balanced_ce: {}\n".format(args.use_class_balanced_ce))
         f.write("cb_beta: {}\n".format(args.cb_beta))
@@ -329,8 +323,6 @@ def write_summary(summary_path, args, last_record, best_auc_info, best_acc_info,
         f.write("search_acc_threshold: {}\n".format(args.search_acc_threshold))
         f.write("use_val_threshold: {}\n".format(args.use_val_threshold))
         f.write("fixed_acc_threshold: {}\n".format(args.fixed_acc_threshold))
-        f.write("ensemble_top_k: {}\n".format(args.ensemble_top_k))
-        f.write("ensemble_metric: {}\n".format(args.ensemble_metric))
         f.write("data_root: {}\n".format(args.data_root))
         f.write("train_dir: {}\n".format(args.train_dir))
         f.write("val_dir: {}\n".format(args.val_dir))
@@ -363,17 +355,6 @@ def write_summary(summary_path, args, last_record, best_auc_info, best_acc_info,
                 "model_path", "checkpoint_path",
             ]:
                 f.write("{}: {}\n".format(key, info[key]))
-
-        f.write("\nEnsemble\n")
-        f.write("-" * 72 + "\n")
-        if ensemble_info is None:
-            f.write("not available\n")
-        else:
-            for key in [
-                "epochs", "selection_metric", "test_loss", "test_acc",
-                "test_auc", "test_f1", "test_threshold", "checkpoint_path",
-            ]:
-                f.write("{}: {}\n".format(key, ensemble_info[key]))
  
 class KDLoss(nn.Module):
     def __init__(self, temp_factor):
@@ -440,8 +421,6 @@ def main():
     parser.add_argument('--lr', default=0.01, type=float, help='initial learning rate')
     parser.add_argument('--save', default=None,
                         help='save directory; defaults to an auto-generated run directory')
-    parser.add_argument('--pretrained', type=str2bool, default=True,
-                        help='use ImageNet-pretrained ResNet18 backbone')
     parser.add_argument('--label_smoothing', default=0.0, type=float,
                         help='label smoothing for the training CE loss')
     parser.add_argument('--use_class_balanced_ce', type=str2bool, default=False,
@@ -504,17 +483,9 @@ def main():
                         help='for binary tasks, tune threshold on validation split and apply it to test')
     parser.add_argument('--fixed_acc_threshold', type=float, default=None,
                         help='fixed binary positive-class threshold for ACC/F1 reporting')
-    parser.add_argument('--ensemble_top_k', type=int, default=0,
-                        help='keep top-k snapshots and evaluate probability ensemble after training')
-    parser.add_argument('--ensemble_metric', type=str, default='val_auc',
-                        choices=('val_auc', 'val_acc', 'test_auc', 'test_acc'),
-                        help='metric used to select top-k ensemble snapshots')
 
     parser.add_argument('--opt', type=str, default='sgd',
-                        choices=('sgd', 'adam', 'adamw', 'rmsprop'))
-    parser.add_argument('--scheduler', type=str, default='poly',
-                        choices=('poly', 'cosine'),
-                        help='learning-rate scheduler')
+                        choices=('sgd', 'adam', 'rmsprop'))
     args = parser.parse_known_args()[0]
     profile = DATASET_PROFILES[args.dataset]
     args.batchSz = profile["batch_size"] if args.batchSz is None else args.batchSz
@@ -548,8 +519,6 @@ def main():
         raise ValueError("--logit_adjust_tau must be >= 0")
     if args.fixed_acc_threshold is not None and not 0.0 <= args.fixed_acc_threshold <= 1.0:
         raise ValueError("--fixed_acc_threshold must be in [0, 1]")
-    if args.ensemble_top_k < 0:
-        raise ValueError("--ensemble_top_k must be >= 0")
 
     setproctitle.setproctitle(args.save)
     criterion_2 = None
@@ -656,17 +625,9 @@ def main():
         num_workers=4,
     )
     valLoader = DataLoader(BCdata_val, batch_size=args.batchSz, shuffle=False, drop_last=False, num_workers=4) if BCdata_val is not None else None
-    if args.ensemble_top_k > 0 and args.ensemble_metric.startswith("val") and valLoader is None:
-        raise ValueError(
-            "--ensemble_metric={} requires a validation split. "
-            "Create data/{}/val/<class_name>/*.jpg, pass --val_dir, "
-            "or use --ensemble_metric test_auc/test_acc for exploratory runs.".format(
-                args.ensemble_metric, args.dataset
-            )
-        )
     testLoader = DataLoader(BCdata_test, batch_size=args.batchSz, shuffle=False, drop_last=False, num_workers=4)
     
-    net = Student_resnet18(first_conv=args.first_conv, class_num=args.class_num, pretrained=args.pretrained)
+    net = Student_resnet18(first_conv=args.first_conv, class_num=args.class_num)
     net = net.to(device) 
     ema_net = create_ema_model(net) if args.use_ema_teacher else None
     args.device = device
@@ -686,20 +647,15 @@ def main():
         optimizer = optim.SGD(net.parameters(), lr = args.lr, momentum=0.9, weight_decay=1e-4)
     elif args.opt == 'adam':
         optimizer = optim.Adam(net.parameters(), lr = args.lr,betas=(0.9, 0.999), weight_decay=1e-4)
-    elif args.opt == 'adamw':
-        optimizer = optim.AdamW(net.parameters(), lr=args.lr, betas=(0.9, 0.999), weight_decay=1e-4)
     elif args.opt == 'rmsprop':
         optimizer = optim.RMSprop(net.parameters(), lr=args.lr, momentum=0.9, weight_decay=1e-4)
     
-    if args.scheduler == 'cosine':
-        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.nEpochs)
-    else:
-        scheduler = PolynomialLR(
-            optimizer=optimizer,
-            step_size= 10,
-            iter_max= args.nEpochs,
-            power= 0.9,
-        )
+    scheduler = PolynomialLR(
+        optimizer=optimizer,
+        step_size= 10,
+        iter_max= args.nEpochs,
+        power= 0.9,
+    )
 
     epoch_log_path = os.path.join(args.save, "epoch_metrics.txt")
     summary_path = os.path.join(args.save, "summary.txt")
@@ -713,28 +669,21 @@ def main():
     best_acc = -float("inf")
     best_auc_info = None
     best_acc_info = None
-    last_epoch_record = None
-    ensemble_snapshots = []
-    ensemble_checkpoint_path = os.path.join(args.save, "ensemble_topk_checkpoint.pth")
     
     for epoch in range(1, args.nEpochs + 1):
         train_metrics = train(args, epoch, net, ema_net, trainLoader, optimizer, criterion,criterion_2,scheduler, entropy_memory)
         eval_net = ema_net if (args.use_ema_teacher and args.eval_ema) else net
         val_metrics = None
         test_threshold = args.fixed_acc_threshold
-        need_val_eval = valLoader is not None and (
-            args.use_val_threshold or (args.ensemble_top_k > 0 and args.ensemble_metric.startswith("val"))
-        )
-        if need_val_eval and args.class_num == 2:
+        if valLoader is not None and args.use_val_threshold and args.class_num == 2:
             val_metrics = test(
                 args, epoch, eval_net, valLoader, optimizer, test_criterion,
                 threshold=None,
-                search_threshold=args.use_val_threshold,
+                search_threshold=True,
                 split_name="val",
             )
-            if args.use_val_threshold:
-                test_threshold = val_metrics["threshold"]
-        elif need_val_eval:
+            test_threshold = val_metrics["threshold"]
+        elif valLoader is not None and args.use_val_threshold:
             val_metrics = test(
                 args, epoch, eval_net, valLoader, optimizer, test_criterion,
                 threshold=None,
@@ -783,25 +732,7 @@ def main():
             "is_best_auc": is_best_auc,
             "is_best_acc": is_best_acc,
         }
-        last_epoch_record = epoch_record
         write_epoch_metrics(epoch_log_path, epoch_record)
-
-        if args.ensemble_top_k > 0:
-            selection_values = {
-                "val_auc": val_metrics["auc"] if val_metrics is not None else None,
-                "val_acc": val_metrics["acc"] if val_metrics is not None else None,
-                "test_auc": test_metrics["auc"],
-                "test_acc": test_metrics["acc"],
-            }
-            selection_metric = selection_values[args.ensemble_metric]
-            if selection_metric is not None:
-                ensemble_snapshots = update_topk_snapshots(
-                    ensemble_snapshots,
-                    clone_state_dict_cpu(eval_net),
-                    selection_metric,
-                    epoch,
-                    max_k=args.ensemble_top_k,
-                )
 
         if is_best_auc:
             best_auc_info = save_best_model(
@@ -827,45 +758,6 @@ def main():
             )
             print_best_message("ACC", epoch, best_acc)
         write_summary(summary_path, args, epoch_record, best_auc_info, best_acc_info)
-
-    ensemble_info = None
-    if len(ensemble_snapshots) > 0:
-        ensemble_threshold = args.fixed_acc_threshold
-        if args.use_val_threshold and valLoader is not None and args.class_num == 2:
-            val_ensemble_metrics = test_ensemble(
-                args, args.nEpochs, eval_net, ensemble_snapshots, valLoader, test_criterion,
-                threshold=None,
-                search_threshold=True,
-                split_name="ens-v",
-            )
-            ensemble_threshold = val_ensemble_metrics["threshold"]
-        ensemble_metrics = test_ensemble(
-            args, args.nEpochs, eval_net, ensemble_snapshots, testLoader, test_criterion,
-            threshold=ensemble_threshold,
-            search_threshold=args.search_acc_threshold and not args.use_val_threshold,
-            split_name="ens",
-        )
-        torch.save(
-            {
-                "selection_metric": args.ensemble_metric,
-                "snapshots": ensemble_snapshots,
-                "metrics": ensemble_metrics,
-                "args": vars(args),
-            },
-            ensemble_checkpoint_path,
-        )
-        ensemble_info = {
-            "epochs": [item["epoch"] for item in ensemble_snapshots],
-            "selection_metric": args.ensemble_metric,
-            "test_loss": ensemble_metrics["loss"],
-            "test_acc": ensemble_metrics["acc"],
-            "test_auc": ensemble_metrics["auc"],
-            "test_f1": ensemble_metrics["f1"],
-            "test_threshold": ensemble_metrics["threshold"],
-            "checkpoint_path": ensemble_checkpoint_path,
-        }
-        if last_epoch_record is not None:
-            write_summary(summary_path, args, last_epoch_record, best_auc_info, best_acc_info, ensemble_info)
 
 
     
@@ -1122,78 +1014,6 @@ def test(args, epoch, net, testLoader,optimizer, criterion,
         "acc": test_acc,
         "auc": test_AUC,
         "f1": test_f1,
-        "threshold": threshold,
-    }
-    print_test_summary(epoch, test_metrics, split_name=split_name)
-    return test_metrics
-
-
-def test_ensemble(args, epoch, net, snapshots, testLoader, criterion,
-                  threshold=None, search_threshold=False, split_name="ens"):
-    """Evaluate a probability ensemble from in-memory top-k snapshots."""
-    if len(snapshots) == 0:
-        return None
-
-    net.eval()
-    total_loss = 0
-    total_correct = 0
-    conMatrix_pre = []
-    conMatrix_tar = []
-    nTrain = len(testLoader.dataset)
-    device = args.device
-
-    with torch.no_grad():
-        for pos_1, target in testLoader:
-            images = pos_1.to(device)
-            target = target.to(device).long().view(-1)
-            prob_sum = None
-            for snapshot in snapshots:
-                state_dict = {
-                    name: value.to(device)
-                    for name, value in snapshot["state_dict"].items()
-                }
-                net.load_state_dict(state_dict)
-                output = tta_forward(net, images, tta_views=args.tta_views)
-                prob = F.softmax(output, dim=1)
-                prob_sum = prob if prob_sum is None else prob_sum + prob
-            output_prob = prob_sum / float(len(snapshots))
-            loss = F.nll_loss(torch.log(output_prob.clamp_min(1e-8)), target)
-            total_loss = loss.item() * images.size(0) + total_loss
-
-            for i in range(len(output_prob)):
-                if args.class_num == 2:
-                    conMatrix_pre.append(float(output_prob[i][1].cpu().detach()))
-                else:
-                    conMatrix_pre.append(output_prob[i].cpu().detach().numpy())
-                conMatrix_tar.append(int(target[i].cpu().detach().numpy()))
-
-            prediction = torch.argmax(output_prob, 1)
-            total_correct += (prediction == target).sum().int().cpu().numpy()
-
-    if args.class_num == 2:
-        test_AUC = metrics.roc_auc_score(np.array(conMatrix_tar), np.array(conMatrix_pre))
-        if threshold is None:
-            threshold = args.fixed_acc_threshold if args.fixed_acc_threshold is not None else 0.5
-        test_acc = total_correct/nTrain
-        if search_threshold:
-            threshold_tensor, acc_tensor = find_best_binary_threshold(
-                torch.tensor(conMatrix_pre),
-                torch.tensor(conMatrix_tar),
-            )
-            threshold = float(threshold_tensor)
-            test_acc = float(acc_tensor)
-        pred_for_f1 = (np.array(conMatrix_pre) >= threshold).astype(np.int64)
-    else:
-        test_AUC = metrics.roc_auc_score(np.array(conMatrix_tar), np.array(conMatrix_pre), multi_class='ovo')
-        threshold = -1.0
-        test_acc = total_correct/nTrain
-        pred_for_f1 = np.argmax(np.array(conMatrix_pre), axis=1)
-
-    test_metrics = {
-        "loss": total_loss/nTrain,
-        "acc": test_acc,
-        "auc": test_AUC,
-        "f1": metrics.f1_score(np.array(conMatrix_tar), pred_for_f1, average='macro'),
         "threshold": threshold,
     }
     print_test_summary(epoch, test_metrics, split_name=split_name)

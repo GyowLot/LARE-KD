@@ -17,10 +17,8 @@ from training_utils import (
     apply_logit_adjustment,
     build_class_balanced_weights,
     build_sample_weights,
-    clone_state_dict_cpu,
     find_best_binary_threshold,
     tta_forward,
-    update_topk_snapshots,
 )
 
 
@@ -153,24 +151,6 @@ class TrainingUtilityTests(unittest.TestCase):
         logits = tta_forward(MeanModel(), images, tta_views=2)
 
         self.assertTrue(torch.allclose(logits, torch.tensor([[0.5, 0.5]]), atol=1e-6))
-
-    def test_topk_snapshots_keep_best_metrics(self):
-        snapshots = []
-        for epoch, metric in [(1, 0.70), (2, 0.90), (3, 0.80)]:
-            state = {"w": torch.tensor([float(epoch)])}
-            snapshots = update_topk_snapshots(snapshots, state, metric, epoch, max_k=2)
-
-        self.assertEqual([item["epoch"] for item in snapshots], [2, 3])
-        self.assertEqual([round(item["metric"], 2) for item in snapshots], [0.90, 0.80])
-
-    def test_clone_state_dict_cpu_is_detached_copy(self):
-        model = torch.nn.Linear(2, 1)
-        cloned = clone_state_dict_cpu(model)
-        original_weight = model.state_dict()["weight"]
-        cloned["weight"].add_(1.0)
-
-        self.assertFalse(torch.allclose(cloned["weight"], original_weight.cpu()))
-        self.assertFalse(cloned["weight"].requires_grad)
 
 
 if __name__ == "__main__":

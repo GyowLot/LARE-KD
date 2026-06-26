@@ -174,37 +174,6 @@ python main.py --dataset derma \
   --kd_weight_rampup 10
 ```
 
-External 224x224 datasets with top-k snapshot ensemble:
-
-```bash
-python main.py --dataset isic_m --data_root ./data \
-  --opt adamw \
-  --lr 0.0003 \
-  --scheduler cosine \
-  --pretrained True \
-  --use_are True \
-  --use_adaptive_temp True \
-  --use_ema_teacher True \
-  --eval_ema True \
-  --use_class_balanced_ce True \
-  --use_balanced_sampler True \
-  --logit_adjust_tau 1.0 \
-  --label_smoothing 0.05 \
-  --tta_views 4 \
-  --use_val_threshold True \
-  --ensemble_top_k 5 \
-  --ensemble_metric val_auc \
-  --are_warmup 20 \
-  --temp_warmup 20 \
-  --are_prob 0.5 \
-  --clahe_clip_limit 1.5 \
-  --lambda_strategy confidence_inverse \
-  --lambda_min 0.8 \
-  --lambda_max 1.2 \
-  --entropy_momentum 0.95 \
-  --kd_weight_rampup 10
-```
-
 Binary validation-tuned ACC run:
 
 ```bash
@@ -250,10 +219,6 @@ python main.py --dataset isic_m --data_root ./data \
 - `--lambda_min`, `--lambda_max`: adaptive lambda range.
 - `--kd_conf_thresh`: minimum teacher confidence required for KD contribution.
 - `--kd_weight_rampup`: linearly warm up the KD loss weight.
-- `--pretrained`: use ImageNet-pretrained ResNet18. This is recommended for
-  ISIC and CBIS-DDSM; set it to `False` if your machine cannot download weights.
-- `--opt`: optimizer. `sgd`, `adam`, `adamw`, and `rmsprop` are supported.
-- `--scheduler`: `poly` or `cosine`.
 - `--use_ema_teacher`: use an EMA copy as the teacher branch.
 - `--ema_decay`: EMA update decay. The default is `0.999`.
 - `--eval_ema`: evaluate and save EMA weights when EMA teacher is enabled.
@@ -271,10 +236,6 @@ python main.py --dataset isic_m --data_root ./data \
 - `--fixed_acc_threshold`: manually set a binary threshold for ACC/F1.
 - `--search_acc_threshold`: optionally search the best binary ACC threshold on
   the evaluation split.
-- `--ensemble_top_k`: keep top-k snapshots and evaluate their probability
-  ensemble at the end of training.
-- `--ensemble_metric`: metric used to select ensemble snapshots. Prefer
-  `val_auc` when a validation split is available.
 - `--save`: output directory. If omitted, a timestamped directory is created
   under `./result/`.
 
@@ -287,15 +248,12 @@ Each run writes these files under the save directory:
 - `best_auc_model.pth` and `best_auc_checkpoint.pth`.
 - `best_acc_model.pth` and `best_acc_checkpoint.pth`.
 - `best_model.pth` and `best_checkpoint.pth`: aliases for the best-AUC model.
-- `ensemble_topk_checkpoint.pth`: saved only when `--ensemble_top_k > 0`.
 
 Training logs include loss, CE loss, KD loss, accuracy, mean lambda, mean
 entropy, mean teacher confidence, ARE application ratio, and KD active ratio.
 `summary.txt` also records class counts, class weights, EMA/TTA settings, and
 all LARE-KD control flags used for the run. For binary tasks it also records the
 probability threshold used for ACC/F1.
-When snapshot ensembling is enabled, `summary.txt` includes the selected epochs
-and the final ensemble test metrics.
 
 ## Practical Notes
 
@@ -316,11 +274,10 @@ and the final ensemble test metrics.
   2. baseline + EMA teacher;
   3. baseline + EMA + class-balanced CE;
   4. baseline + EMA + class-balanced CE + balanced sampler + logit adjustment;
-  5. full LARE-KD + EMA + class-balanced CE + balanced sampler + TTA;
-  6. full LARE-KD + top-k snapshot ensemble selected by validation AUC.
+  5. full LARE-KD + EMA + class-balanced CE + balanced sampler + TTA.
 
 ## Quick Verification
 
 ```bash
-python -m py_compile main.py Net.py adaptive_temp.py attention_enhance.py datapreprocess.py training_utils.py
+python -m py_compile main.py adaptive_temp.py attention_enhance.py datapreprocess.py training_utils.py
 ```
