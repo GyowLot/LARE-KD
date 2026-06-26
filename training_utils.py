@@ -30,6 +30,42 @@ def build_class_balanced_weights(class_counts, beta=0.9999, device=None):
     return weights / weights.mean().clamp_min(1e-8)
 
 
+def build_sample_weights(labels, num_classes):
+    """Build per-sample weights from inverse class frequency.
+
+    Args:
+        labels: 1D tensor/list of integer class labels.
+        num_classes: number of classes.
+
+    Returns:
+        torch.Tensor with shape [num_samples].
+    """
+    labels = torch.as_tensor(labels, dtype=torch.long).view(-1)
+    counts = torch.bincount(labels, minlength=num_classes).float().clamp_min(1.0)
+    class_weights = 1.0 / counts
+    sample_weights = class_weights[labels]
+    return sample_weights / sample_weights.mean().clamp_min(1e-8)
+
+
+def apply_logit_adjustment(logits, class_counts, tau=0.0):
+    """Apply class-prior logit adjustment for long-tailed training.
+
+    Args:
+        logits: classifier logits with shape [B, C].
+        class_counts: 1D tensor/list with class counts.
+        tau: adjustment strength. ``0`` disables the adjustment.
+
+    Returns:
+        Adjusted logits with the same shape as ``logits``.
+    """
+    if tau <= 0:
+        return logits
+    counts = torch.as_tensor(class_counts, dtype=logits.dtype, device=logits.device).view(1, -1)
+    priors = counts / counts.sum(dim=1, keepdim=True).clamp_min(1e-8)
+    adjustment = torch.log(priors.clamp_min(1e-8)) * float(tau)
+    return logits + adjustment
+
+
 def extract_class_counts(dataset, num_classes):
     """Extract class counts from MedMNIST or ImageFolder-like datasets.
 
@@ -56,6 +92,21 @@ def extract_class_counts(dataset, num_classes):
     if counts.numel() > num_classes:
         counts = counts[:num_classes]
     return counts
+
+
+def extract_labels(dataset):
+    """Extract a flat label tensor from MedMNIST or ImageFolder-like datasets."""
+    labels = None
+    if hasattr(dataset, "targets"):
+        labels = dataset.targets
+    elif hasattr(dataset, "labels"):
+        labels = dataset.labels
+    elif hasattr(dataset, "dataset"):
+        return extract_labels(dataset.dataset)
+
+    if labels is None:
+        raise ValueError("Unable to infer labels: dataset has no targets/labels attribute")
+    return torch.as_tensor(labels, dtype=torch.long).view(-1)
 
 
 def create_ema_model(model):
@@ -118,3 +169,37 @@ def tta_forward(model, images, tta_views=1):
     for transform in transforms[: min(int(tta_views), len(transforms))]:
         logits.append(model(transform(images)))
     return torch.stack(logits, dim=0).mean(dim=0)
+
+
+def find_best_binary_threshold(probs, targets):
+    """Find the binary probability threshold with the highest accuracy.
+
+    Args:
+        probs: positive-class probabilities with shape [N].
+        targets: binary labels with shape [N].
+
+    Returns:
+        (threshold, accuracy) as torch scalar tensors.
+    """
+    probs = torch.as_tensor(probs, dtype=torch.float32).view(-1)
+    targets = torch.as_tensor(targets, dtype=torch.long).view(-1)
+    if probs.numel() != targets.numel():
+        raise ValueError("probs and targets must have the same number of elements")
+    if probs.numel() == 0:
+        raise ValueError("cannot search threshold on an empty array")
+
+    thresholds = torch.unique(probs).sort().values
+    thresholds = torch.cat([
+        torch.tensor([0.0], dtype=probs.dtype, device=probs.device),
+        thresholds,
+        torch.tensor([1.0], dtype=probs.dtype, device=probs.device),
+    ])
+    best_threshold = thresholds[0]
+    best_acc = torch.tensor(-1.0, dtype=probs.dtype, device=probs.device)
+    for threshold in thresholds:
+        pred = (probs >= threshold).long()
+        acc = (pred == targets).float().mean()
+        if acc > best_acc:
+            best_acc = acc
+            best_threshold = threshold
+    return best_threshold, best_acc

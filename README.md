@@ -152,6 +152,8 @@ python main.py --dataset derma \
   --use_ema_teacher True \
   --eval_ema True \
   --use_class_balanced_ce True \
+  --use_balanced_sampler True \
+  --logit_adjust_tau 1.0 \
   --label_smoothing 0.05 \
   --tta_views 4 \
   --are_warmup 20 \
@@ -165,12 +167,34 @@ python main.py --dataset derma \
   --kd_weight_rampup 10
 ```
 
+Binary validation-tuned ACC run:
+
+```bash
+python main.py --dataset isic_m --data_root ./data \
+  --use_are True \
+  --use_adaptive_temp True \
+  --use_ema_teacher True \
+  --eval_ema True \
+  --use_class_balanced_ce True \
+  --use_balanced_sampler True \
+  --logit_adjust_tau 1.0 \
+  --label_smoothing 0.05 \
+  --tta_views 4 \
+  --search_acc_threshold True
+```
+
+`--search_acc_threshold True` searches the best positive-class probability
+threshold on the evaluation split. Use it for validation-set model selection or
+threshold tuning. For a strictly fair final test comparison, tune the threshold
+on a validation split and keep it fixed for test reporting.
+
 External ImageFolder example:
 
 ```bash
 python main.py --dataset isic_m --data_root ./data \
   --use_are True --use_adaptive_temp True \
-  --use_ema_teacher True --use_class_balanced_ce True --tta_views 4
+  --use_ema_teacher True --use_class_balanced_ce True \
+  --use_balanced_sampler True --tta_views 4
 ```
 
 ## Important Options
@@ -191,9 +215,14 @@ python main.py --dataset isic_m --data_root ./data \
 - `--eval_ema`: evaluate and save EMA weights when EMA teacher is enabled.
 - `--use_class_balanced_ce`: use effective-number class weights for CE.
 - `--cb_beta`: beta value for class-balanced CE.
+- `--use_balanced_sampler`: use inverse-frequency weighted sampling.
+- `--logit_adjust_tau`: add class-prior log probabilities to training CE logits.
+  This helps long-tailed datasets when set around `0.5` to `1.0`.
 - `--label_smoothing`: CE label smoothing.
 - `--tta_views`: deterministic test-time augmentation views. Use `4` for
   original, horizontal flip, vertical flip, and both flips.
+- `--search_acc_threshold`: optionally search the best binary ACC threshold on
+  the evaluation split.
 - `--save`: output directory. If omitted, a timestamped directory is created
   under `./result/`.
 
@@ -210,13 +239,15 @@ Each run writes these files under the save directory:
 Training logs include loss, CE loss, KD loss, accuracy, mean lambda, mean
 entropy, mean teacher confidence, ARE application ratio, and KD active ratio.
 `summary.txt` also records class counts, class weights, EMA/TTA settings, and
-all LARE-KD control flags used for the run.
+all LARE-KD control flags used for the run. For binary tasks it also records the
+probability threshold used for ACC/F1.
 
 ## Practical Notes
 
-- The first serious run should use EMA teacher, class-balanced CE, and TTA. They
-  directly target the most common failure modes in DermaMNIST, ISIC, and
-  CBIS-DDSM: unstable teacher targets and class imbalance.
+- The first serious run should use EMA teacher, class-balanced CE, balanced
+  sampling, logit adjustment, and TTA. They directly target the most common
+  failure modes in DermaMNIST, ISIC, and CBIS-DDSM: unstable teacher targets,
+  class imbalance, and fixed-threshold ACC sensitivity.
 - If LARE-KD performs worse than the baseline, first try conservative settings:
   `--lambda_min 0.8 --lambda_max 1.2 --are_prob 0.5 --clahe_clip_limit 1.5`.
 - Use `epoch_metrics.txt` to check whether the issue is early instability,
@@ -229,7 +260,8 @@ all LARE-KD control flags used for the run.
   1. baseline TSS-KD;
   2. baseline + EMA teacher;
   3. baseline + EMA + class-balanced CE;
-  4. full LARE-KD + EMA + class-balanced CE + TTA.
+  4. baseline + EMA + class-balanced CE + balanced sampler + logit adjustment;
+  5. full LARE-KD + EMA + class-balanced CE + balanced sampler + TTA.
 
 ## Quick Verification
 

@@ -13,7 +13,7 @@ from torch.autograd import Variable
 import torchvision.datasets as dset
 import torchvision.transforms as transforms
 from torchvision.utils import save_image
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, WeightedRandomSampler
 import os
 import sys
 import math
@@ -33,9 +33,13 @@ from adaptive_temp import (
 )
 from attention_enhance import apply_local_clahe_tensor, generate_attention_map, get_attention_boxes
 from training_utils import (
+    apply_logit_adjustment,
     build_class_balanced_weights,
+    build_sample_weights,
     create_ema_model,
     extract_class_counts,
+    extract_labels,
+    find_best_binary_threshold,
     tta_forward,
     update_ema_model,
 )
@@ -128,6 +132,7 @@ def print_run_config(args, num_params):
     print(" Batch size     : {:<12} Epochs      : {}".format(args.batchSz, args.nEpochs))
     print(" Optimizer      : {:<12} LR          : {}".format(args.opt, args.lr))
     print(" Label smooth   : {:<12} CB loss     : {}".format(args.label_smoothing, format_flag(args.use_class_balanced_ce).strip()))
+    print(" Balanced samp. : {:<12} Logit adj.  : {}".format(format_flag(args.use_balanced_sampler).strip(), args.logit_adjust_tau))
     print(" Temperature    : {:<12} Fixed lambda: {}".format(args.temp, args.fixed_lambda))
     print(" ARE            : {:<12} Warmup      : {}".format(format_flag(args.use_are), args.are_warmup))
     print(" ARE prob       : {:<12} CLAHE clip  : {}".format(args.are_prob, args.clahe_clip_limit))
@@ -136,6 +141,7 @@ def print_run_config(args, num_params):
     print(" Lambda strategy: {:<12} KD rampup   : {}".format(args.lambda_strategy, args.kd_weight_rampup))
     print(" EMA teacher    : {:<12} Decay       : {}".format(format_flag(args.use_ema_teacher).strip(), args.ema_decay))
     print(" Eval EMA       : {:<12} TTA views   : {}".format(format_flag(args.eval_ema).strip(), args.tta_views))
+    print(" ACC threshold  : {}".format(format_flag(args.search_acc_threshold).strip()))
     print(" Save dir       : {}".format(args.save))
     if args.dataset_source == "imagefolder":
         print(" Train dir      : {}".format(args.train_dir))
@@ -201,12 +207,13 @@ def print_test_summary(epoch, metrics):
     """Print the test summary for one epoch."""
     print(
         "[test  summary] epoch {:03d} | loss {:8.4f} | acc {:6.2%} | "
-        "auc {:6.4f} | f1 {:6.4f}".format(
+        "auc {:6.4f} | f1 {:6.4f} | thr {:5.3f}".format(
             epoch,
             metrics["loss"],
             metrics["acc"],
             metrics["auc"],
             metrics["f1"],
+            metrics["threshold"],
         )
     )
 
@@ -223,7 +230,7 @@ def write_epoch_metrics(log_path, metrics_dict):
         "mean_lambda", "mean_entropy", "mean_teacher_conf",
         "are_active_ratio", "kd_active_ratio",
         "are_enabled", "adaptive_temp_enabled",
-        "test_loss", "test_acc", "test_auc", "test_f1",
+        "test_loss", "test_acc", "test_auc", "test_f1", "test_threshold",
         "best_auc", "best_acc", "is_best_auc", "is_best_acc",
     ]
     needs_header = not os.path.exists(log_path)
@@ -258,6 +265,7 @@ def save_best_model(args, epoch, net, optimizer, train_metrics, test_metrics,
         "test_acc": test_metrics["acc"],
         "test_auc": test_metrics["auc"],
         "test_f1": test_metrics["f1"],
+        "test_threshold": test_metrics["threshold"],
         "train_loss": train_metrics["loss"],
         "train_ce_loss": train_metrics["ce_loss"],
         "train_kd_loss": train_metrics["kd_loss"],
@@ -290,6 +298,8 @@ def write_summary(summary_path, args, last_record, best_auc_info, best_acc_info)
         f.write("label_smoothing: {}\n".format(args.label_smoothing))
         f.write("use_class_balanced_ce: {}\n".format(args.use_class_balanced_ce))
         f.write("cb_beta: {}\n".format(args.cb_beta))
+        f.write("use_balanced_sampler: {}\n".format(args.use_balanced_sampler))
+        f.write("logit_adjust_tau: {}\n".format(args.logit_adjust_tau))
         f.write("class_counts: {}\n".format(args.class_counts))
         f.write("class_weights: {}\n".format(args.class_weights))
         f.write("temp: {}\n".format(args.temp))
@@ -307,6 +317,7 @@ def write_summary(summary_path, args, last_record, best_auc_info, best_acc_info)
         f.write("ema_decay: {}\n".format(args.ema_decay))
         f.write("eval_ema: {}\n".format(args.eval_ema))
         f.write("tta_views: {}\n".format(args.tta_views))
+        f.write("search_acc_threshold: {}\n".format(args.search_acc_threshold))
         f.write("data_root: {}\n".format(args.data_root))
         f.write("train_dir: {}\n".format(args.train_dir))
         f.write("test_dir: {}\n".format(args.test_dir))
@@ -318,7 +329,7 @@ def write_summary(summary_path, args, last_record, best_auc_info, best_acc_info)
             "mean_lambda", "mean_entropy", "mean_teacher_conf",
             "are_active_ratio", "kd_active_ratio",
             "test_loss", "test_acc", "test_auc",
-            "test_f1", "best_auc", "best_acc",
+            "test_f1", "test_threshold", "best_auc", "best_acc",
         ]:
             f.write("{}: {}\n".format(key, last_record[key]))
 
@@ -330,6 +341,7 @@ def write_summary(summary_path, args, last_record, best_auc_info, best_acc_info)
                 continue
             for key in [
                 "epoch", "best_metric", "test_loss", "test_acc", "test_auc", "test_f1",
+                "test_threshold",
                 "train_loss", "train_ce_loss", "train_kd_loss", "train_acc",
                 "mean_lambda", "mean_entropy", "mean_teacher_conf",
                 "are_active_ratio", "kd_active_ratio",
@@ -406,6 +418,10 @@ def main():
                         help='use effective-number class-balanced CE weights')
     parser.add_argument('--cb_beta', default=0.9999, type=float,
                         help='beta for effective-number class-balanced CE')
+    parser.add_argument('--use_balanced_sampler', type=str2bool, default=False,
+                        help='use inverse-frequency weighted sampling for the train loader')
+    parser.add_argument('--logit_adjust_tau', default=0.0, type=float,
+                        help='class-prior logit adjustment strength for the training CE loss')
     parser.add_argument('--use_are', type=str2bool, default=False,
                         help='enable Attention-guided Regional Enhancement')
     parser.add_argument('--are_warmup', type=int, default=10,
@@ -452,6 +468,8 @@ def main():
                         help='evaluate and save the EMA model when EMA teacher is enabled')
     parser.add_argument('--tta_views', type=int, default=1,
                         help='test-time augmentation views: 1 original, 2 +hflip, 3 +vflip, 4 +hvflip')
+    parser.add_argument('--search_acc_threshold', type=str2bool, default=False,
+                        help='search the best binary ACC threshold on the evaluation split')
 
     parser.add_argument('--opt', type=str, default='sgd',
                         choices=('sgd', 'adam', 'rmsprop'))
@@ -484,6 +502,8 @@ def main():
         raise ValueError("--ema_decay must be in [0, 1)")
     if args.tta_views < 1:
         raise ValueError("--tta_views must be >= 1")
+    if args.logit_adjust_tau < 0:
+        raise ValueError("--logit_adjust_tau must be >= 0")
 
     setproctitle.setproctitle(args.save)
     criterion_2 = None
@@ -552,8 +572,26 @@ def main():
         label_smoothing=args.label_smoothing,
     )
     test_criterion = nn.CrossEntropyLoss()
+    train_sampler = None
+    train_shuffle = True
+    if args.use_balanced_sampler:
+        train_labels = extract_labels(BCdata_trian_base)
+        sample_weights = build_sample_weights(train_labels, args.class_num)
+        train_sampler = WeightedRandomSampler(
+            weights=sample_weights,
+            num_samples=len(sample_weights),
+            replacement=True,
+        )
+        train_shuffle = False
     
-    trainLoader = DataLoader(BCdata_trian, batch_size=args.batchSz, shuffle=True, drop_last=True, num_workers=4)
+    trainLoader = DataLoader(
+        BCdata_trian,
+        batch_size=args.batchSz,
+        shuffle=train_shuffle,
+        sampler=train_sampler,
+        drop_last=True,
+        num_workers=4,
+    )
     testLoader = DataLoader(BCdata_test, batch_size=args.batchSz, shuffle=False, drop_last=False, num_workers=4)
     
     net = Student_resnet18(first_conv=args.first_conv, class_num=args.class_num)
@@ -628,6 +666,7 @@ def main():
             "test_acc": test_metrics["acc"],
             "test_auc": test_metrics["auc"],
             "test_f1": test_metrics["f1"],
+            "test_threshold": test_metrics["threshold"],
             "best_auc": best_auc,
             "best_acc": best_acc,
             "is_best_auc": is_best_auc,
@@ -732,7 +771,8 @@ def train(args, epoch, net, ema_net, trainLoader, optimizer, criterion, criterio
             
         output = net(images_2)
         
-        loss_1 = criterion(output,target)
+        ce_logits = apply_logit_adjustment(output, args.class_counts, tau=args.logit_adjust_tau)
+        loss_1 = criterion(ce_logits,target)
 #         loss_2 = criterion_2(output, output_last.detach())
         entropy = compute_entropy(teacher_prob)
         if adaptive_temp_enabled:
@@ -887,19 +927,29 @@ def test(args, epoch, net, testLoader,optimizer, criterion):
 #     print(conMatrix_pre)
     if args.class_num == 2:
         test_AUC = metrics.roc_auc_score(np.array(conMatrix_tar), np.array(conMatrix_pre))
+        threshold = 0.5
+        test_acc = total_correct/nTrain
+        if args.search_acc_threshold:
+            threshold_tensor, acc_tensor = find_best_binary_threshold(
+                torch.tensor(conMatrix_pre),
+                torch.tensor(conMatrix_tar),
+            )
+            threshold = float(threshold_tensor)
+            test_acc = float(acc_tensor)
+        pred_for_f1 = (np.array(conMatrix_pre) >= threshold).astype(np.int64)
     else:
         test_AUC = metrics.roc_auc_score(np.array(conMatrix_tar), np.array(conMatrix_pre), multi_class='ovo')
-    test_f1 = metrics.f1_score(
-        np.array(conMatrix_tar),
-        np.argmax(np.array(conMatrix_pre), axis=1) if args.class_num != 2 else (np.array(conMatrix_pre) >= 0.5).astype(np.int64),
-        average='macro',
-    )
+        threshold = -1.0
+        test_acc = total_correct/nTrain
+        pred_for_f1 = np.argmax(np.array(conMatrix_pre), axis=1)
+    test_f1 = metrics.f1_score(np.array(conMatrix_tar), pred_for_f1, average='macro')
 
     test_metrics = {
         "loss": total_loss/nTrain,
-        "acc": total_correct/nTrain,
+        "acc": test_acc,
         "auc": test_AUC,
         "f1": test_f1,
+        "threshold": threshold,
     }
     print_test_summary(epoch, test_metrics)
     return test_metrics

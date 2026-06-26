@@ -13,7 +13,13 @@ from adaptive_temp import (
     update_entropy_memory,
 )
 from attention_enhance import generate_attention_map, get_attention_boxes
-from training_utils import build_class_balanced_weights, tta_forward
+from training_utils import (
+    apply_logit_adjustment,
+    build_class_balanced_weights,
+    build_sample_weights,
+    find_best_binary_threshold,
+    tta_forward,
+)
 
 
 class AttentionEnhanceTests(unittest.TestCase):
@@ -106,6 +112,31 @@ class TrainingUtilityTests(unittest.TestCase):
         self.assertEqual(tuple(weights.shape), (2,))
         self.assertGreater(float(weights[1]), float(weights[0]))
         self.assertAlmostEqual(float(weights.mean()), 1.0, places=6)
+
+    def test_sample_weights_follow_inverse_class_frequency(self):
+        labels = torch.tensor([0, 0, 0, 1])
+
+        sample_weights = build_sample_weights(labels, num_classes=2)
+
+        self.assertEqual(tuple(sample_weights.shape), (4,))
+        self.assertGreater(float(sample_weights[3]), float(sample_weights[0]))
+
+    def test_logit_adjustment_lowers_minority_prior_more_during_training(self):
+        logits = torch.zeros(1, 2)
+        class_counts = torch.tensor([90, 10])
+
+        adjusted = apply_logit_adjustment(logits, class_counts, tau=1.0)
+
+        self.assertGreater(float(adjusted[0, 0]), float(adjusted[0, 1]))
+
+    def test_binary_threshold_search_can_improve_accuracy(self):
+        probs = torch.tensor([0.10, 0.20, 0.40, 0.45, 0.60])
+        targets = torch.tensor([0, 0, 1, 1, 1])
+
+        threshold, acc = find_best_binary_threshold(probs, targets)
+
+        self.assertLess(float(threshold), 0.5)
+        self.assertAlmostEqual(float(acc), 1.0, places=6)
 
     def test_tta_forward_averages_original_and_flipped_predictions(self):
         class MeanModel(torch.nn.Module):
