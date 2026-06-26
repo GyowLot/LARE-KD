@@ -145,6 +145,7 @@ def print_run_config(args, num_params):
     print(" Save dir       : {}".format(args.save))
     if args.dataset_source == "imagefolder":
         print(" Train dir      : {}".format(args.train_dir))
+        print(" Val dir        : {}".format(args.val_dir))
         print(" Test dir       : {}".format(args.test_dir))
     print(" Parameters     : {:,}".format(num_params))
     print("=" * 72)
@@ -203,11 +204,12 @@ def print_train_summary(epoch, metrics):
     )
 
 
-def print_test_summary(epoch, metrics):
+def print_test_summary(epoch, metrics, split_name="test"):
     """Print the test summary for one epoch."""
     print(
-        "[test  summary] epoch {:03d} | loss {:8.4f} | acc {:6.2%} | "
+        "[{:>5} summary] epoch {:03d} | loss {:8.4f} | acc {:6.2%} | "
         "auc {:6.4f} | f1 {:6.4f} | thr {:5.3f}".format(
+            split_name,
             epoch,
             metrics["loss"],
             metrics["acc"],
@@ -230,6 +232,7 @@ def write_epoch_metrics(log_path, metrics_dict):
         "mean_lambda", "mean_entropy", "mean_teacher_conf",
         "are_active_ratio", "kd_active_ratio",
         "are_enabled", "adaptive_temp_enabled",
+        "val_loss", "val_acc", "val_auc", "val_f1", "val_threshold",
         "test_loss", "test_acc", "test_auc", "test_f1", "test_threshold",
         "best_auc", "best_acc", "is_best_auc", "is_best_acc",
     ]
@@ -318,8 +321,11 @@ def write_summary(summary_path, args, last_record, best_auc_info, best_acc_info)
         f.write("eval_ema: {}\n".format(args.eval_ema))
         f.write("tta_views: {}\n".format(args.tta_views))
         f.write("search_acc_threshold: {}\n".format(args.search_acc_threshold))
+        f.write("use_val_threshold: {}\n".format(args.use_val_threshold))
+        f.write("fixed_acc_threshold: {}\n".format(args.fixed_acc_threshold))
         f.write("data_root: {}\n".format(args.data_root))
         f.write("train_dir: {}\n".format(args.train_dir))
+        f.write("val_dir: {}\n".format(args.val_dir))
         f.write("test_dir: {}\n".format(args.test_dir))
 
         f.write("\nLast epoch metrics\n")
@@ -328,6 +334,7 @@ def write_summary(summary_path, args, last_record, best_auc_info, best_acc_info)
             "epoch", "train_loss", "train_ce_loss", "train_kd_loss", "train_acc",
             "mean_lambda", "mean_entropy", "mean_teacher_conf",
             "are_active_ratio", "kd_active_ratio",
+            "val_loss", "val_acc", "val_auc", "val_f1", "val_threshold",
             "test_loss", "test_acc", "test_auc",
             "test_f1", "test_threshold", "best_auc", "best_acc",
         ]:
@@ -395,6 +402,8 @@ def main():
                         help='root directory for ImageFolder datasets')
     parser.add_argument('--train_dir', type=str, default=None,
                         help='optional ImageFolder train directory override')
+    parser.add_argument('--val_dir', type=str, default=None,
+                        help='optional ImageFolder validation directory override')
     parser.add_argument('--test_dir', type=str, default=None,
                         help='optional ImageFolder test directory override')
     parser.add_argument('--batchSz', type=int, default=None,
@@ -470,6 +479,10 @@ def main():
                         help='test-time augmentation views: 1 original, 2 +hflip, 3 +vflip, 4 +hvflip')
     parser.add_argument('--search_acc_threshold', type=str2bool, default=False,
                         help='search the best binary ACC threshold on the evaluation split')
+    parser.add_argument('--use_val_threshold', type=str2bool, default=False,
+                        help='for binary tasks, tune threshold on validation split and apply it to test')
+    parser.add_argument('--fixed_acc_threshold', type=float, default=None,
+                        help='fixed binary positive-class threshold for ACC/F1 reporting')
 
     parser.add_argument('--opt', type=str, default='sgd',
                         choices=('sgd', 'adam', 'rmsprop'))
@@ -504,6 +517,8 @@ def main():
         raise ValueError("--tta_views must be >= 1")
     if args.logit_adjust_tau < 0:
         raise ValueError("--logit_adjust_tau must be >= 0")
+    if args.fixed_acc_threshold is not None and not 0.0 <= args.fixed_acc_threshold <= 1.0:
+        raise ValueError("--fixed_acc_threshold must be in [0, 1]")
 
     setproctitle.setproctitle(args.save)
     criterion_2 = None
@@ -534,14 +549,25 @@ def main():
     
     if args.dataset_source == "medmnist":
         dataset_cls = MEDMNIST_REGISTRY[args.dataset]
+        args.val_dir = "medmnist:val"
         BCdata_trian_base = dataset_cls(split='train', transform=ContrastiveLearningViewGenerator(trainTransform,n_views=2),download=True)
+        BCdata_val = dataset_cls(split='val', transform=ContrastiveLearningViewGenerator(testTransform,n_views=1),download=True)
         BCdata_test = dataset_cls(split='test', transform=ContrastiveLearningViewGenerator(testTransform,n_views=1),download=True)
     else:
         train_dir = args.train_dir or os.path.join(args.data_root, args.dataset, "train")
+        val_dir = args.val_dir or os.path.join(args.data_root, args.dataset, "val")
         test_dir = args.test_dir or os.path.join(args.data_root, args.dataset, "test")
         args.train_dir = train_dir
+        args.val_dir = val_dir
         args.test_dir = test_dir
         BCdata_trian_base = build_imagefolder_dataset(train_dir, trainTransform, n_views=2)
+        BCdata_val = build_imagefolder_dataset(val_dir, testTransform, n_views=1) if os.path.isdir(val_dir) else None
+        if args.use_val_threshold and BCdata_val is None:
+            raise FileNotFoundError(
+                "Validation threshold tuning requires a validation ImageFolder directory.\n"
+                "Expected: {}\n"
+                "Create data/{}/val/<class_name>/*.jpg or pass --val_dir.".format(val_dir, args.dataset)
+            )
         BCdata_test = build_imagefolder_dataset(test_dir, testTransform, n_views=1)
         if len(BCdata_trian_base.classes) != args.class_num:
             raise ValueError(
@@ -553,6 +579,12 @@ def main():
             raise ValueError(
                 "Train/test class folders do not match. train={}, test={}".format(
                     BCdata_trian_base.classes, BCdata_test.classes
+                )
+            )
+        if BCdata_val is not None and BCdata_val.classes != BCdata_trian_base.classes:
+            raise ValueError(
+                "Train/val class folders do not match. train={}, val={}".format(
+                    BCdata_trian_base.classes, BCdata_val.classes
                 )
             )
     BCdata_trian = IndexedDataset(BCdata_trian_base)
@@ -592,6 +624,7 @@ def main():
         drop_last=True,
         num_workers=4,
     )
+    valLoader = DataLoader(BCdata_val, batch_size=args.batchSz, shuffle=False, drop_last=False, num_workers=4) if BCdata_val is not None else None
     testLoader = DataLoader(BCdata_test, batch_size=args.batchSz, shuffle=False, drop_last=False, num_workers=4)
     
     net = Student_resnet18(first_conv=args.first_conv, class_num=args.class_num)
@@ -640,7 +673,29 @@ def main():
     for epoch in range(1, args.nEpochs + 1):
         train_metrics = train(args, epoch, net, ema_net, trainLoader, optimizer, criterion,criterion_2,scheduler, entropy_memory)
         eval_net = ema_net if (args.use_ema_teacher and args.eval_ema) else net
-        test_metrics = test(args, epoch, eval_net, testLoader,optimizer, test_criterion)
+        val_metrics = None
+        test_threshold = args.fixed_acc_threshold
+        if valLoader is not None and args.use_val_threshold and args.class_num == 2:
+            val_metrics = test(
+                args, epoch, eval_net, valLoader, optimizer, test_criterion,
+                threshold=None,
+                search_threshold=True,
+                split_name="val",
+            )
+            test_threshold = val_metrics["threshold"]
+        elif valLoader is not None and args.use_val_threshold:
+            val_metrics = test(
+                args, epoch, eval_net, valLoader, optimizer, test_criterion,
+                threshold=None,
+                search_threshold=False,
+                split_name="val",
+            )
+        test_metrics = test(
+            args, epoch, eval_net, testLoader, optimizer, test_criterion,
+            threshold=test_threshold,
+            search_threshold=args.search_acc_threshold and not args.use_val_threshold,
+            split_name="test",
+        )
         torch.save(eval_net, os.path.join(args.save, str(epoch)+'.pth'))
         is_best_auc = test_metrics["auc"] > best_auc
         is_best_acc = test_metrics["acc"] > best_acc
@@ -662,6 +717,11 @@ def main():
             "kd_active_ratio": train_metrics["kd_active_ratio"],
             "are_enabled": train_metrics["are_enabled"],
             "adaptive_temp_enabled": train_metrics["adaptive_temp_enabled"],
+            "val_loss": val_metrics["loss"] if val_metrics is not None else None,
+            "val_acc": val_metrics["acc"] if val_metrics is not None else None,
+            "val_auc": val_metrics["auc"] if val_metrics is not None else None,
+            "val_f1": val_metrics["f1"] if val_metrics is not None else None,
+            "val_threshold": val_metrics["threshold"] if val_metrics is not None else None,
             "test_loss": test_metrics["loss"],
             "test_acc": test_metrics["acc"],
             "test_auc": test_metrics["auc"],
@@ -887,7 +947,8 @@ def train(args, epoch, net, ema_net, trainLoader, optimizer, criterion, criterio
 
 
 
-def test(args, epoch, net, testLoader,optimizer, criterion):
+def test(args, epoch, net, testLoader,optimizer, criterion,
+         threshold=None, search_threshold=None, split_name="test"):
     net.eval()
     total_loss = 0
     total_correct = 0
@@ -925,11 +986,15 @@ def test(args, epoch, net, testLoader,optimizer, criterion):
             total_correct += (prediction == target).sum().int().cpu().numpy()
             
 #     print(conMatrix_pre)
+    if search_threshold is None:
+        search_threshold = args.search_acc_threshold
+
     if args.class_num == 2:
         test_AUC = metrics.roc_auc_score(np.array(conMatrix_tar), np.array(conMatrix_pre))
-        threshold = 0.5
+        if threshold is None:
+            threshold = args.fixed_acc_threshold if args.fixed_acc_threshold is not None else 0.5
         test_acc = total_correct/nTrain
-        if args.search_acc_threshold:
+        if search_threshold:
             threshold_tensor, acc_tensor = find_best_binary_threshold(
                 torch.tensor(conMatrix_pre),
                 torch.tensor(conMatrix_tar),
@@ -951,7 +1016,7 @@ def test(args, epoch, net, testLoader,optimizer, criterion):
         "f1": test_f1,
         "threshold": threshold,
     }
-    print_test_summary(epoch, test_metrics)
+    print_test_summary(epoch, test_metrics, split_name=split_name)
     return test_metrics
 
 

@@ -65,22 +65,29 @@ data/
   isic_m/
     train/class0/*.jpg
     train/class1/*.jpg
+    val/class0/*.jpg
+    val/class1/*.jpg
     test/class0/*.jpg
     test/class1/*.jpg
   isic_k/
     train/class0/*.jpg
     train/class1/*.jpg
+    val/class0/*.jpg
+    val/class1/*.jpg
     test/class0/*.jpg
     test/class1/*.jpg
   cbis/
     train/class0/*.jpg
     train/class1/*.jpg
+    val/class0/*.jpg
+    val/class1/*.jpg
     test/class0/*.jpg
     test/class1/*.jpg
 ```
 
-You can also pass `--train_dir` and `--test_dir` to directly specify ImageFolder
-paths.
+You can also pass `--train_dir`, `--val_dir`, and `--test_dir` to directly
+specify ImageFolder paths. MedMNIST uses its official `train`, `val`, and `test`
+splits.
 
 ## Installation
 
@@ -180,13 +187,15 @@ python main.py --dataset isic_m --data_root ./data \
   --logit_adjust_tau 1.0 \
   --label_smoothing 0.05 \
   --tta_views 4 \
-  --search_acc_threshold True
+  --use_val_threshold True
 ```
 
-`--search_acc_threshold True` searches the best positive-class probability
-threshold on the evaluation split. Use it for validation-set model selection or
-threshold tuning. For a strictly fair final test comparison, tune the threshold
-on a validation split and keep it fixed for test reporting.
+`--use_val_threshold True` searches the best positive-class probability
+threshold on the validation split and applies that fixed threshold to test ACC
+and F1. This is the recommended fair setting for binary tasks. The older
+`--search_acc_threshold True` option searches the threshold on the evaluated
+split itself; keep it for debugging or validation analysis, not final test
+reporting.
 
 External ImageFolder example:
 
@@ -221,6 +230,10 @@ python main.py --dataset isic_m --data_root ./data \
 - `--label_smoothing`: CE label smoothing.
 - `--tta_views`: deterministic test-time augmentation views. Use `4` for
   original, horizontal flip, vertical flip, and both flips.
+- `--val_dir`: optional ImageFolder validation directory.
+- `--use_val_threshold`: tune a binary threshold on validation and apply it to
+  test ACC/F1.
+- `--fixed_acc_threshold`: manually set a binary threshold for ACC/F1.
 - `--search_acc_threshold`: optionally search the best binary ACC threshold on
   the evaluation split.
 - `--save`: output directory. If omitted, a timestamped directory is created
